@@ -1,0 +1,20 @@
+[package]
+name = "dock"
+version = "26.1.0"
+edition = "2021"
+license = "TCL"
+description = "The Powerfull TontooOS Dock"
+authors = ["arlomu"]
+
+[[bin]]
+name = "dock"
+path = "src/main.rs"
+
+[dependencies]
+sdk = { path = "/Library/System/sdk", features = ["UIKit", "CoreIcon", "UIKitDynamics", "TontooUI"] }
+gtk = { package = "gtk4", version = "0.9" }
+glib = "0.20"
+image = "0.25"
+x11rb = { version = "0.13", features = ["randr", "shape"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
