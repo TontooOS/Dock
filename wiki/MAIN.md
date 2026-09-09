@@ -15,7 +15,7 @@ bottom-center with click-through outside. Hover magnification is disabled.
 |---|---|---|
 | Main index | [MAIN.md](MAIN.md) | This page |
 | Rules | [RULE.md](RULE.md) | Development and usage rules |
-| Dock | [Dock.md](Dock.md) | Glass dock: dots, bounce, separator, HiDPI, lang (magnification removed) |
+| Dock | [Dock.md](Dock.md) | Glass dock: CoreWindows programs, dots, launch, bounce, HiDPI, lang |
 
 ## Quick Start
 

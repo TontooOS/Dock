@@ -12,7 +12,7 @@ intentionally disabled (static icons).
 |---|---|---|---|
 | Glass Panel | `PANEL_RADIUS` | `20` px | Continuous squircle, 18–24 px macOS range |
 | Glass Panel | `PANEL_HEIGHT` | `90` px logical | `((53+2*11)*1.2)` 10% smaller, icon centered |
-| Glass Panel | `PANEL_WIDTH` | `465` px logical | `7*53+6*9+2*20` more side padding |
+| Glass Panel | `panel_width()` | `n*53+(n-1)*9+2*20` px logical | Dynamic: LaunchPad tile + pinned programs (`TILE_COUNT`) |
 | Glass Panel | `BORDER_WIDTH` | `1` px | Hairline border |
 | Material Light | `panel_fill` | `rgba(255,255,255,0.30)` | Frosted white tint, 0.25–0.35 |
 | Material Light | `border_color` | `rgba(255,255,255,0.40)` | 0.5–1 px hairline |
@@ -43,6 +43,23 @@ Dark mode (`src/main.rs:54` `Appearance::material`) uses `rgba(30,30,30,0.60)` a
 `0 16px 48px rgba(0,0,0,0.45), 0 6px 20px rgba(0,0,0,0.38)`. Appearance is
 resolved via `ColorScheme::detect_system()` with `DOCK_APPEARANCE=light|dark`
 override (`src/main.rs:35`).
+
+## Programs (CoreWindows)
+
+Installed programs come from CoreWindows `list_programs()`
+(`~/Applications` + `/Applications`, sorted by display name;
+`src/apps.rs`). The dock pins the first `DOCK_APP_COUNT = 5` entries
+after the LaunchPad tile; the LaunchPad shows every installed program.
+Tile icons prefer the bundle icon file (`AppEntry.icon.icon_path`,
+used as-is); programs without a bundle icon get a generated CoreIcon
+gradient tile keyed by bundle id (`tontoo-dock-<bundle>-<light|dark>-v3.png`).
+
+When no `.app` bundles are installed (e.g. dev machines), a hardcoded
+demo set is shown instead (`apps::DEMO_PROGRAMS` in the dock,
+`apps::demo_launchpad()` in the LaunchPad) with the legacy log/spawn
+click behavior. The separator (`dock-item-sep`) is only shown in demo
+mode; with real programs there is no system area, so no separator is
+rendered.
 
 ## Temp Icon Generation
 
@@ -106,10 +123,18 @@ delay – no custom hover label is rendered. No explicit timeout is set in
 `GtkSettings` properties do not exist on GTK4 and setting them panics with
 `property 'gtk-tooltip-timeout' of type 'GtkSettings' not found`.
 
-### Running Indicators (src/main.rs:381)
+### Running Indicators (src/main.rs, src/apps.rs)
 
-Each tile is wrapped in a vertical `dock-item` box (`src/main.rs:550`) with a
-4 px dot below the button:
+Each tile is wrapped in a vertical `dock-item` box with a
+4 px dot below the button. Dots reflect the CoreWindows open-window
+list (`WindowsProvider::windows()`, the "list opened programs" API):
+a tile shows its dot when its bundle id or app name matches an open
+window. The list is re-queried every 2 s on the main loop and each dot
+is toggled accordingly (`src/main.rs` refresh timeout).
+
+Without a reachable window daemon only demo entries show dots, using
+the legacy heuristic (`Finder`/`Mail` always, `Sliders` while its
+process runs via `x11_place::is_app_running()`).
 
 ```rust
 let dot = gtk::Box::new(Orientation::Horizontal, 0);
@@ -117,9 +142,8 @@ dot.add_css_class("dock-dot");
 dot.set_margin_top(4);
 ```
 
-`is_running_app()` (`src/main.rs:438`) marks Finder/Mail as running by
-default and queries `x11_place::is_app_running()` for transient apps (e.g.
-vlc). CSS (`src/main.rs:500`):
+`apps::is_running()` matches the tile against the snapshot; demo
+fallback without a daemon uses the legacy heuristic. CSS:
 
 ```css
 .dock-dot { background: rgba(30,30,30,0.72); /* light */ }
@@ -145,17 +169,17 @@ client-count loop that re-bounces until the window appears
 
 ## Layout & Separation
 
-- Panel is bottom-center with `BOTTOM_GAP = 8` (`src/main.rs:111`), matching
-  macOS 8–12 px float. Window `win_w = PANEL_WIDTH + GHOST_SIZE` (79),
+- Panel is bottom-center with `BOTTOM_GAP = 8`, matching
+  macOS 8–12 px float. Window `win_w = panel_width() + GHOST_SIZE` (79),
   `win_h = PANEL_HEIGHT + GHOST_SIZE + BOTTOM_GAP` is placed
-  `mx + (mw - win_w*scale)/2` / `my + mh - win_h*scale` in physical pixels
-  (`src/main.rs:1914`). Dock is 10% smaller (`449×90` vs `500×101`), icons
+  `mx + (mw - win_w*scale)/2` / `my + mh - win_h*scale` in physical pixels.
+  Dock is 10% smaller (`449×90` vs `500×101`), icons
   only 5% smaller (`53` vs `56`). Icons are vertically centered: wrapper
-  `valign: Center` with `margin_top = (DOT_SIZE+DOT_MARGIN)/2` (`src/main.rs:633`)
+  `valign: Center`
   so the icon center aligns to panel center (dot sits in bottom padding).
-- Row holds `dock-item` wrappers (`src/main.rs:622`) with `ICON_GAP = 9`.
+- Row holds `dock-item` wrappers with `ICON_GAP = 9`.
   A vertical separator is rendered as a right border on the item after
-  `SEPARATOR_AFTER = 4` (`src/main.rs:560`):
+  `separator_after` (demo fallback mode only, `Some(4)`):
 
 ```css
 .dock-item-sep { border-right: 1px solid rgba(0,0,0,0.10); padding-right:10px; margin-right:4px; }
@@ -219,22 +243,43 @@ animates affected icons with a translate delta (`src/main.rs:1277`). Drop
 via the overlay `GestureClick` restores panel-only input and suppresses the
 follow-up click for 50 ms.
 
+## Launching (src/launcher.rs)
+
+Clicking a tile never runs app code inside the dock. `launcher::launch_app()`
+hands the bundle path to a detached helper on a throwaway thread (the GTK
+main loop is never blocked):
+
+1. Preferred: the LaunchPad daemon (`/run/launchpad.sock`, `start_app` op,
+   same framing as `launchpad_lib::LaunchpadClient::start_app`). The daemon
+   supervises the app as its own temp process, so a crashing app can never
+   take the dock down.
+2. Fallback: `tapp` (FishRunner, always at `/usr/bin/tapp` on TontooOS,
+   plain `tapp` from `PATH` elsewhere) is spawned detached with nulled
+   stdio and its own process group on Linux. The dock never waits on it.
+
+Dock tiles bounce first, then launch. LaunchPad tiles launch and close the
+grid macOS-style. Demo entries without a bundle only log (Sliders keeps its
+legacy `vlc` launch loop).
+
 ## Launchpad
 
-Launchpad (`src/launchpad.rs:179` `show_launchpad()`) opens centered
-`900x600` with a `760x520` card. Background follows the system spec:
+Launchpad (`src/launchpad.rs` `show_launchpad(items)`) opens centered
+`900x600` with a `760x520` card showing every installed program (empty
+input falls back to the demo grid). Background follows the system spec:
 light `rgba(236,236,236,0.90)` (`#ececec`), dark `rgba(29,29,29,0.90)`
 (`#1d1d1d`), plus `blur(24px) saturate(180%)`.
 
-### Async Icon Loading (src/launchpad.rs:44)
+### Async Icon Loading
 
-All 30 grid icons plus the top Tontoo octopus icon were generated
+Grid icons plus the top Tontoo octopus icon were generated
 synchronously with `IconCanvas::save` on the UI thread, blocking the window
 for 15-20 s behind an empty transparent frame. The fix:
 
 1. Build the skeleton first with letter placeholders
-   (`placeholder_tile()`, shared `app_style()` mapping).
-2. Serve cache hits (`/tmp/tontoo-launchpad-*-v2.png`) instantly.
+   (`placeholder_tile()`, shared `apps::fallback_style()` mapping).
+2. Serve bundle icons (`AppEntry.icon.icon_path`) and cache hits
+   (`/tmp/tontoo-launchpad-*-v2.png` demo, `/tmp/tontoo-launchpad-*-v3.png`
+   bundle-id keyed) instantly.
 3. `present()` the window immediately, then upgrade missing icons one per
    5 ms `timeout_add_local` tick without freezing input.
 4. Load the Tontoo top icon async via `generate_tontoo_icon_cached()`
@@ -243,14 +288,16 @@ for 15-20 s behind an empty transparent frame. The fix:
 No `set_visible(true)` before content exists, so no empty transparent frame
 is shown.
 
-### Cache Prewarm (src/launchpad.rs:88, src/main.rs)
+### Cache Prewarm (src/launchpad.rs, src/main.rs)
 
 `launchpad::prewarm_step()` generates one missing cache file per call without
-GTK calls. `main()` schedules it on the main loop (start after 2 s, then one
-icon per 50 ms), so the first Launchpad open after `/tmp` was cleared or
-`ICON_GEN_VERSION` bumped is already warm. Cache hits skip generation
-entirely. Main thread only: `CoreIcon::generator::ASSETS_DIR` is `static
-mut`, so a background thread would data-race and abort GTK randomly.
+GTK calls over the real program list (loaded once via `OnceLock`; demo grid
+when nothing is installed). Bundle icons need no warming. `main()` schedules
+it on the main loop (start after 2 s, then one icon per 50 ms), so the first
+Launchpad open after `/tmp` was cleared or a cache version bump is already
+warm. Cache hits skip generation entirely. Main thread only:
+`CoreIcon::generator::ASSETS_DIR` is `static mut`, so a background thread
+would data-race and abort GTK randomly.
 
 ## Building and Testing
 
@@ -262,7 +309,7 @@ DOCK_DEBUG=1 ./target/debug/dock           # verbose placement
 ```
 
 Dependencies via `/Library/System/sdk` (`UIKit`, `CoreIcon`,
-`UIKitDynamics`, `TontooUI`) plus `serde_json` for `lang/` files.
+`UIKitDynamics`, `TontooUI`, `CoreWindows`) plus `serde_json` for `lang/` files.
 
 ## Cross References
 

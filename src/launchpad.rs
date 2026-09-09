@@ -7,15 +7,16 @@ use crate::UIKit::app::ColorScheme;
 
 use crate::CoreIcon::generator::*;
 use crate::CoreIcon::octopus::OctopusVariant;
-use crate::CoreIcon::{
-    APP_FILL, CALENDAR, Color as IconColor, ENVELOPE_FILL, GEARSHAPE_FILL, Gradient,
-    GradientDirection, GradientStop, MACWINDOW, MAGNIFYINGGLASS, MAP_FILL, MESSAGE_FILL,
-    MUSIC_NOTE, NOTE_TEXT, PHOTO_FILL, SAFARI_FILL, SFSymbol, SLIDER_HORIZONTAL_3,
-    TERMINAL_FILL,
-};
+use crate::CoreIcon::{Color as IconColor, Gradient, GradientDirection, GradientStop, SFSymbol};
+
+use crate::apps::{fallback_style, AppItem};
 
 const ICON_CORNER_RADIUS: f32 = 250.0;
+/// Cache version of the legacy demo tiles (`tontoo-launchpad-<name>-v2.png`).
 const ICON_GEN_VERSION: u32 = 2;
+/// Cache version of tiles generated for real programs
+/// (`tontoo-launchpad-<bundle-id>-v3.png`).
+const REAL_ICON_GEN_VERSION: u32 = 3;
 
 fn shade(c: IconColor, amount: f32) -> IconColor {
     let mix = |v: f32| {
@@ -47,45 +48,37 @@ fn icon_cache_path(name: &str) -> Option<String> {
         .ok()
 }
 
-/// Shared color + symbol mapping so sync/async/prewarm all render identical icons.
-fn app_style(name: &str) -> (&'static str, SFSymbol) {
-    match name {
-        "Firefox" => ("#FF9500", SAFARI_FILL),
-        "Mail" => ("#007AFF", ENVELOPE_FILL),
-        "System Settings" => ("#636e72", GEARSHAPE_FILL),
-        "App Store" => ("#0A84FF", APP_FILL),
-        "Calculator" => ("#4CAF50", APP_FILL),
-        "Calendar" => ("#FF3B30", CALENDAR),
-        "Books" => ("#FF9500", NOTE_TEXT),
-        "Contacts" => ("#5AC8FA", MESSAGE_FILL),
-        "FaceTime" => ("#34C759", MESSAGE_FILL),
-        "Music" => ("#AF52DE", MUSIC_NOTE),
-        "Photos" => ("#00B894", PHOTO_FILL),
-        _ => {
-            const COLORS: &[&str] = &[
-                "#FF3B30", "#007AFF", "#34C759", "#AF52DE", "#FF9500", "#5AC8FA", "#0A84FF",
-                "#6C5CE7", "#D63031", "#00B894", "#E17055", "#636e72",
-            ];
-            const SYMBOLS: &[SFSymbol] = &[
-                APP_FILL,
-                ENVELOPE_FILL,
-                GEARSHAPE_FILL,
-                MACWINDOW,
-                MESSAGE_FILL,
-                MUSIC_NOTE,
-                PHOTO_FILL,
-                SAFARI_FILL,
-                CALENDAR,
-                TERMINAL_FILL,
-                MAP_FILL,
-                NOTE_TEXT,
-                SLIDER_HORIZONTAL_3,
-                MAGNIFYINGGLASS,
-            ];
-            let h = name.len() * 31 + *name.as_bytes().first().unwrap_or(&b'A') as usize;
-            (COLORS[h % COLORS.len()], SYMBOLS[h % SYMBOLS.len()])
+/// Cache path for tiles generated for real programs (keyed by bundle id so
+/// renames never collide and demo tiles are never reused).
+fn real_icon_cache_path(bundle_id: &str) -> Option<String> {
+    let safe: String = bundle_id
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    std::env::temp_dir()
+        .join(format!(
+            "tontoo-launchpad-{}-v{}.png",
+            safe, REAL_ICON_GEN_VERSION
+        ))
+        .into_os_string()
+        .into_string()
+        .ok()
+}
+
+/// The list the prewarm step warms: all installed programs, or the demo
+/// grid when nothing is installed. Loaded once, then served index by index.
+fn prewarm_list() -> &'static [AppItem] {
+    use std::sync::OnceLock;
+    static LIST: OnceLock<Vec<AppItem>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let all = crate::apps::load_all();
+        if all.is_empty() {
+            crate::apps::demo_launchpad()
+        } else {
+            all
         }
-    }
+    })
 }
 
 /// Single-threaded prewarm step for the Dock main loop (NOT a background
@@ -96,8 +89,9 @@ fn app_style(name: &str) -> (&'static str, SFSymbol) {
 pub fn prewarm_step() -> bool {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static IDX: AtomicUsize = AtomicUsize::new(0);
-    // 0,1 = tontoo black/white, then APPS indices + 2
-    let total = APPS.len() + 2;
+    let list = prewarm_list();
+    // 0,1 = tontoo black/white, then list indices + 2
+    let total = list.len() + 2;
     let i = IDX.fetch_add(1, Ordering::Relaxed);
     if i >= total {
         return false;
@@ -106,9 +100,21 @@ pub fn prewarm_step() -> bool {
         let _ = generate_tontoo_icon_cached(true);
     } else if i == 1 {
         let _ = generate_tontoo_icon_cached(false);
-    } else if let Some((name, _)) = APPS.get(i - 2) {
-        let (col, sym) = app_style(name);
-        let _ = generate_launchpad_icon(name, col, sym);
+    } else if let Some(item) = list.get(i - 2) {
+        // Bundle icons need no warming (loaded straight from the bundle).
+        let has_bundle_icon = item
+            .icon_path
+            .as_deref()
+            .map(|p| p.is_file())
+            .unwrap_or(false);
+        if !has_bundle_icon {
+            if item.bundle_path.is_some() {
+                let _ = generate_real_icon(item);
+            } else {
+                let (col, sym) = fallback_style(&item.display_name);
+                let _ = generate_launchpad_icon(&item.display_name, col, sym);
+            }
+        }
     }
     true
 }
@@ -121,11 +127,25 @@ pub fn prewarm_cache() {
 }
 
 fn generate_launchpad_icon(name: &str, hex: &str, symbol: SFSymbol) -> Option<String> {
-    let base = IconColor::from_hex(hex)?;
     let path = icon_cache_path(name)?;
     if std::path::Path::new(&path).is_file() {
         return Some(path);
     }
+    render_tile(&path, name, hex, symbol)
+}
+
+/// Generated tile for a real program without a bundle icon.
+/// Keyed by bundle id (never collides with demo tiles).
+fn generate_real_icon(item: &AppItem) -> Option<String> {
+    let path = real_icon_cache_path(&item.bundle_id)?;
+    if std::path::Path::new(&path).is_file() {
+        return Some(path);
+    }
+    render_tile(&path, &item.display_name, item.color, item.symbol)
+}
+/// Render one generated tile PNG to `path`.
+fn render_tile(path: &str, name: &str, hex: &str, symbol: SFSymbol) -> Option<String> {
+    let base = IconColor::from_hex(hex)?;
     let canvas = IconCanvas::new()
         .background(Background::gradient(Gradient::new(
             GradientDirection::TopToBottom,
@@ -144,46 +164,13 @@ fn generate_launchpad_icon(name: &str, hex: &str, symbol: SFSymbol) -> Option<St
                 .tint(IconColor::WHITE),
         );
     match canvas.save(&path) {
-        Ok(()) => Some(path),
+        Ok(()) => Some(path.to_owned()),
         Err(err) => {
             eprintln!("[launchpad] icon generation failed for {name}: {err}");
             None
         }
     }
 }
-
-const APPS: &[(&str, &str)] = &[
-    ("Firefox", "Firefox"),
-    ("Mail", "Mail"),
-    ("System Settings", "System Settings"),
-    ("ICUE", "ICUE"),
-    ("Preview", "Preview"),
-    ("AdBlock Pro", "AdBlock Pro"),
-    ("App Store", "App Store"),
-    ("Automator", "Automator"),
-    ("BetterDisplay", "BetterDisplay"),
-    ("Books", "Books"),
-    ("Calculator", "Calculator"),
-    ("Calendar", "Calendar"),
-    ("Chess", "Chess"),
-    ("Clock", "Clock"),
-    ("Contacts", "Contacts"),
-    ("Dictionary", "Dictionary"),
-    ("Epic Games Lau..", "Epic Games Launcher"),
-    ("Epic Seven", "Epic Seven"),
-    ("Eve", "Eve"),
-    ("FaceTime", "FaceTime"),
-    ("Music", "Music"),
-    ("News", "News"),
-    ("Stocks", "Stocks"),
-    ("Voice Memos", "Voice Memos"),
-    ("Home", "Home"),
-    ("Podcasts", "Podcasts"),
-    ("TV", "TV"),
-    ("Wallet", "Wallet"),
-    ("Shortcuts", "Shortcuts"),
-    ("Find My", "Find My"),
-];
 
 fn generate_tontoo_icon_cached(is_light: bool) -> Option<String> {
     let variant = if is_light { OctopusVariant::Black } else { OctopusVariant::White };
@@ -265,7 +252,14 @@ fn placeholder_tile(col: &str, name: &str) -> gtk::Box {
     icon_box
 }
 
-pub fn show_launchpad() {
+/// Open the LaunchPad grid for `items` (all installed programs).
+/// An empty list shows the demo grid instead.
+pub fn show_launchpad(items: Vec<AppItem>) {
+    let entries: Vec<AppItem> = if items.is_empty() {
+        crate::apps::demo_launchpad()
+    } else {
+        items
+    };
     let win = gtk::Window::new();
     win.set_title(Some("LaunchPad"));
     win.set_default_size(900, 600);
@@ -431,10 +425,11 @@ pub fn show_launchpad() {
     flow.set_margin_top(8);
 
     ensure_assets_dir();
-    // Pending icons for async upgrade: (button, name). Placeholders are shown
+    // Pending icons for async upgrade: (button, item). Placeholders are shown
     // instantly so the window is never an empty transparent frame.
-    let pending: Rc<RefCell<Vec<(gtk::Button, String)>>> = Rc::new(RefCell::new(Vec::new()));
-    for (name, _) in APPS.iter() {
+    let pending: Rc<RefCell<Vec<(gtk::Button, AppItem)>>> = Rc::new(RefCell::new(Vec::new()));
+    for item in entries.iter() {
+        let name = item.display_name.as_str();
         let child = gtk::FlowBoxChild::new();
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
         vbox.set_halign(gtk::Align::Center);
@@ -448,23 +443,41 @@ pub fn show_launchpad() {
         let tp = gtk::CssProvider::new();
         tp.load_from_string("button.app-tile, button.app-tile:hover, button.app-tile:active, button.app-tile:focus { background: transparent; background-color: transparent; border: none; box-shadow: none; outline: none; }");
         btn.style_context().add_provider(&tp, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 40);
-        let (col, _sym) = app_style(name);
-        // Fast path: cached file -> show immediately. Slow path: placeholder,
-        // real icon is generated one-by-one in the idle loader below.
+        // Fast path, in order:
+        // 1. bundle icon file shipped by the program (used as-is),
+        // 2. generated tile cache hit (legacy demo key or bundle-id key),
+        // 3. letter placeholder + async generation in the idle loader below.
+        let bundle_icon = item
+            .icon_path
+            .as_deref()
+            .filter(|p| p.is_file())
+            .and_then(|p| p.to_str().map(str::to_owned));
         let mut use_placeholder = true;
-        if let Some(cached) = icon_cache_path(name) {
-            if std::path::Path::new(&cached).is_file() {
-                let img = gtk::Image::from_file(&cached);
-                img.set_pixel_size(64);
-                btn.set_child(Some(&img));
-                use_placeholder = false;
+        if let Some(icon) = bundle_icon {
+            let img = gtk::Image::from_file(&icon);
+            img.set_pixel_size(64);
+            btn.set_child(Some(&img));
+            use_placeholder = false;
+        } else {
+            let cached = if item.bundle_path.is_some() {
+                real_icon_cache_path(&item.bundle_id)
+            } else {
+                icon_cache_path(name)
+            };
+            if let Some(cached) = cached {
+                if std::path::Path::new(&cached).is_file() {
+                    let img = gtk::Image::from_file(&cached);
+                    img.set_pixel_size(64);
+                    btn.set_child(Some(&img));
+                    use_placeholder = false;
+                }
             }
         }
         if use_placeholder {
-            btn.set_child(Some(&placeholder_tile(col, name)));
-            pending.borrow_mut().push((btn.clone(), name.to_string()));
+            btn.set_child(Some(&placeholder_tile(item.color, name)));
+            pending.borrow_mut().push((btn.clone(), item.clone()));
         }
-        let txt = gtk::Label::new(Some(*name));
+        let txt = gtk::Label::new(Some(name));
         txt.set_halign(gtk::Align::Center);
         txt.set_ellipsize(gtk::pango::EllipsizeMode::End);
         txt.set_max_width_chars(10);
@@ -473,13 +486,21 @@ pub fn show_launchpad() {
         child.set_child(Some(&vbox));
         flow.append(&child);
         flow_children.borrow_mut().push((name.to_string(), child));
-        // Launchpad icons are static – drag to dock is disabled per user request.
-        // Only the dock itself is reorderable at the bottom.
+        // Click launches the program out-of-process (LaunchPad daemon temp
+        // process, fallback detached tapp) and closes the grid macOS-style.
+        // Demo entries without a bundle only log. Drag to dock is disabled
+        // per user request – only the dock itself is reorderable.
         {
-            let n = *name;
+            let item_c = item.clone();
             let b = btn.clone();
+            let win_c = win.clone();
             b.connect_clicked(move |_| {
-                println!("[launchpad] clicked {n} (no drag)");
+                if let Some(bundle_path) = item_c.bundle_path.as_deref() {
+                    crate::launcher::launch_app(bundle_path, &item_c.display_name);
+                    win_c.close();
+                } else {
+                    println!("[launchpad] clicked {} (no drag)", item_c.display_name);
+                }
             });
         }
     }
@@ -517,12 +538,17 @@ pub fn show_launchpad() {
         let win_c = win.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(5), move || {
             let item = pending_c.borrow_mut().pop();
-            let Some((btn, name)) = item else {
+            let Some((btn, item)) = item else {
                 return glib::ControlFlow::Break;
             };
             let _ = &win_c;
-            let (col, sym) = app_style(&name);
-            match generate_launchpad_icon(&name, col, sym) {
+            let generated = if item.bundle_path.is_some() {
+                generate_real_icon(&item)
+            } else {
+                let (col, sym) = fallback_style(&item.display_name);
+                generate_launchpad_icon(&item.display_name, col, sym)
+            };
+            match generated {
                 Some(path) => {
                     let img = gtk::Image::from_file(&path);
                     img.set_pixel_size(64);

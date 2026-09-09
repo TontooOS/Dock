@@ -177,8 +177,8 @@ pub fn set_launchpad_hover(hover: bool) {
 /// Prüft ob Punkt (global logical) über Dock-Panel liegt (mit Toleranz)
 pub fn is_over_dock(logical_x: i32, logical_y: i32, scale: i32) -> bool {
     // Dock Panel Rect wie in place_dock: bottom-center – synced with main.rs constants
-    // ICON 53 (5% smaller), GAP 9, ROW_PAD 20, PANEL 465x90, BOTTOM_GAP 8
-    const PANEL_WIDTH: i32 = 7 * 53 + 6 * 9 + 2 * 20;
+    // Panel width is dynamic (LaunchPad tile + pinned programs, see crate::panel_width).
+    let panel_width: i32 = crate::panel_width();
     const PANEL_HEIGHT: i32 = ((53 + 2 * 11) as f32 * 1.2) as i32;
     const BOTTOM_GAP: i32 = 8;
     // Monitor logisch
@@ -192,12 +192,12 @@ pub fn is_over_dock(logical_x: i32, logical_y: i32, scale: i32) -> bool {
     let (mx, my, mw, mh) = x11_place::primary_monitor()
         .map(|(a, b, c, d)| (a / scale, b / scale, c / scale, d / scale))
         .unwrap_or((0, 0, 1920, 1080));
-    let dock_x = mx + (mw - PANEL_WIDTH) / 2;
+    let dock_x = mx + (mw - panel_width) / 2;
     let dock_y = my + mh - PANEL_HEIGHT - BOTTOM_GAP;
     // Toleranz 40px größer für leichtes Hover
     let pad = 40;
     logical_x >= dock_x - pad
-        && logical_x <= dock_x + PANEL_WIDTH + pad
+        && logical_x <= dock_x + panel_width + pad
         && logical_y >= dock_y - pad
         && logical_y <= dock_y + PANEL_HEIGHT + pad
 }

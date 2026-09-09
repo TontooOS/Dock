@@ -7,6 +7,7 @@ use gtk::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 sdk::preinclude!();
 use UIKit::prelude::*;
@@ -14,15 +15,14 @@ use UIKit::widget::apply_css;
 use UIKitDynamics::{Spring, SpringPreset};
 use CoreIcon::generator::*;
 use CoreIcon::{
-    APP_FILL, CALENDAR, Color as IconColor, ENVELOPE_FILL, GEARSHAPE_FILL, Gradient,
-    GradientDirection, GradientStop, MACWINDOW, MAGNIFYINGGLASS, MAP_FILL, MESSAGE_FILL,
-    MUSIC_NOTE, NOTE_TEXT, PHOTO_FILL, SAFARI_FILL, SFSymbol, SLIDER_HORIZONTAL_3,
-    TERMINAL_FILL,
+    Color as IconColor, Gradient, GradientDirection, GradientStop, SFSymbol,
 };
 
+mod apps;
 mod backdrop;
 mod bridge;
 mod launchpad;
+mod launcher;
 
 /// Border width / color
 const BORDER_WIDTH: i32 = 1;
@@ -131,13 +131,24 @@ const POP_MS: u64 = 180;
 const PANEL_SCALE: f32 = 1.2;
 const DOT_SIZE: i32 = 4;
 const DOT_MARGIN: i32 = 4;
-// Panel ~7% smaller overall with more side padding: 465×90. Derived without dot so icon is centered.
-const PANEL_HEIGHT: i32 = ((ICON_SIZE + 2 * 11) as f32 * PANEL_SCALE).round() as i32; // 90
-const PANEL_WIDTH: i32 = APPS.len() as i32 * ICON_SIZE
-    + (APPS.len() as i32 - 1) * ICON_GAP
-    + 2 * ROW_PAD; // 465 (7% smaller, more side breathing room)
-// Separator after Nth app (0-indexed) – between apps and system area
-const SEPARATOR_AFTER: usize = 4; // after 5th icon (like macOS apps | folders/trash)
+// Panel width follows the live tile count (LaunchPad tile + pinned programs):
+// `n * ICON_SIZE + (n - 1) * ICON_GAP + 2 * ROW_PAD`.
+static TILE_COUNT: AtomicUsize = AtomicUsize::new(6);
+
+/// Current panel width in logical pixels for the live tile count.
+pub fn panel_width() -> i32 {
+    let n = TILE_COUNT.load(Ordering::Relaxed).max(1) as i32;
+    n * ICON_SIZE + (n - 1) * ICON_GAP + 2 * ROW_PAD
+}
+
+fn set_tile_count(n: usize) {
+    TILE_COUNT.store(n.max(1), Ordering::Relaxed);
+}
+// Panel height is icon-driven and independent of the tile count: 90 px
+// logical with the icon vertically centered (dot sits in bottom padding).
+pub const PANEL_HEIGHT: i32 = ((ICON_SIZE + 2 * 11) as f32 * PANEL_SCALE).round() as i32; // 90
+// Separator after Nth tile (0-indexed) – only used in demo fallback mode;
+// with real programs there is no system area, so no separator is shown.
 
 // ── i18n (SF Pro + lang/) ──────────────────────────────────────────────
 const SF_FAMILY: &str = "SF Pro Display";
@@ -163,7 +174,7 @@ fn load_lang() -> HashMap<String, String> {
         }
     }
     let mut fallback = HashMap::new();
-    for (k, v) in APPS.iter().map(|(n, _, _, _)| (*n, *n)) {
+    for (k, v) in apps::DEMO_PROGRAMS.iter().map(|(n, _, _, _)| (*n, *n)) {
         fallback.insert(format!("dock.app.{}", k.to_lowercase()), v.to_string());
     }
     fallback.insert("dock.launchpad".to_string(), "Launchpad".to_string());
@@ -249,15 +260,9 @@ const ICON_GEN_VERSION: u32 = 3;
 const LAUNCHPAD_GEN_VERSION: u32 = 6;
 const LAUNCHPAD_SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Resources/launchpad.png");
 
-const APPS: &[(&str, &str, SFSymbol, Option<&str>)] = &[
-    ("Launchpad", "#FFFFFF", APP_FILL, None),
-    ("Sliders", "#0A84FF", SLIDER_HORIZONTAL_3, Some("vlc")),
-    ("Finder", "#6C5CE7", MACWINDOW, None),
-    ("Mail", "#D63031", ENVELOPE_FILL, None),
-    ("Music", "#E17055", MUSIC_NOTE, None),
-    ("Photos", "#00B894", PHOTO_FILL, None),
-    ("Settings", "#636e72", GEARSHAPE_FILL, None),
-];
+// NOTE: the pinned programs come from CoreWindows (`apps::load()`); the demo
+// fallback table lives in `apps::DEMO_PROGRAMS`. There is no hardcoded APPS
+// list here anymore.
 
 fn rgba(c: (u8, u8, u8), a: f64) -> String {
     format!("rgba({}, {}, {}, {})", c.0, c.1, c.2, a)
@@ -273,20 +278,23 @@ fn shade(c: IconColor, amount: f32) -> IconColor {
     IconColor::new(mix(c.r), mix(c.g), mix(c.b), 1.0)
 }
 
-fn generate_app_icon(
-    name: &str,
+/// Generate one fallback tile keyed by `key` (bundle id or demo name).
+fn generate_named_icon(
+    key: &str,
     hex: &str,
     symbol: SFSymbol,
     appearance: Appearance,
 ) -> Option<String> {
-    if name == "Launchpad" {
-        return generate_launchpad_icon(appearance);
-    }
+    let safe: String = key
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     let base = IconColor::from_hex(hex)?;
     let path = std::env::temp_dir()
         .join(format!(
             "tontoo-dock-{}-{}-v{}.png",
-            name.to_lowercase(),
+            safe,
             appearance.cache_suffix(),
             ICON_GEN_VERSION
         ))
@@ -319,7 +327,7 @@ fn generate_app_icon(
     match canvas.save(&path) {
         Ok(()) => Some(path),
         Err(err) => {
-            eprintln!("[dock] icon generation failed for {name}: {err}");
+            eprintln!("[dock] icon generation failed for {key}: {err}");
             None
         }
     }
@@ -443,34 +451,45 @@ fn generate_launchpad_icon(appearance: Appearance) -> Option<String> {
     }
 }
 
-fn generate_temp_icons(appearance: Appearance) -> Vec<Option<String>> {
+/// Resolve one dock tile icon: the bundle icon file when the program ships
+/// one, otherwise a generated CoreIcon fallback tile (cached per bundle id
+/// and appearance).
+fn resolve_tile_icon(item: &apps::AppItem, appearance: Appearance) -> Option<String> {
+    if let Some(path) = item.icon_path.as_deref() {
+        if path.is_file() {
+            return path.to_str().map(str::to_owned);
+        }
+    }
+    generate_named_icon(&item.bundle_id, item.color, item.symbol, appearance)
+}
+
+fn generate_temp_icons(appearance: Appearance, dock_apps: &[apps::AppItem]) -> Vec<Option<String>> {
     unsafe { ASSETS_DIR = COREICON_ASSETS };
-    APPS.iter()
-        .map(
-            |(name, hex, symbol, _cmd)| match generate_app_icon(name, hex, *symbol, appearance) {
-                Some(path) => Some(path),
-                None => None,
-            },
-        )
-        .collect()
+    let mut icons = Vec::with_capacity(dock_apps.len() + 1);
+    icons.push(generate_launchpad_icon(appearance));
+    icons.extend(
+        dock_apps
+            .iter()
+            .map(|item| resolve_tile_icon(item, appearance)),
+    );
+    icons
 }
 
 // ── Dock panel view ────────────────────────────────────────────────────
 struct DockPanelView {
+    /// Tile icons aligned with the tiles: `[launchpad, app0, app1, ...]`.
     icons: Vec<Option<String>>,
+    /// Pinned programs (without the LaunchPad tile).
+    dock_apps: Vec<apps::AppItem>,
+    /// All installed programs, opened in the LaunchPad.
+    all_apps: Vec<apps::AppItem>,
+    /// Open-program snapshot for the running dots.
+    running: apps::OpenSnapshot,
+    /// Separator tile index (`Some(4)` in demo mode, `None` with real data).
+    separator_after: Option<usize>,
     appearance: Appearance,
     backdrop: Option<String>,
     lang: HashMap<String, String>,
-}
-
-fn is_running_app(name: &str) -> bool {
-    // Demo running indicators – Finder & Mail are considered running by default
-    // plus any app where the process is detected (e.g. vlc for Sliders)
-    match name {
-        "Finder" | "Mail" => true,
-        "Sliders" => crate::x11_place::is_app_running(),
-        _ => false,
-    }
 }
 
 impl ViewContent for DockPanelView {
@@ -487,7 +506,7 @@ impl ViewContent for DockPanelView {
         top_overlay.set_child(Some(&bg));
 
         let overlay = gtk::Overlay::new();
-        overlay.set_size_request(PANEL_WIDTH, PANEL_HEIGHT);
+        overlay.set_size_request(panel_width(), PANEL_HEIGHT);
         overlay.set_halign(gtk::Align::Center);
         overlay.set_valign(gtk::Align::End);
         overlay.set_margin_bottom(BOTTOM_GAP);
@@ -553,8 +572,9 @@ impl ViewContent for DockPanelView {
             dragging: Option<DragState>,
             suppress_click: bool,
         }
+        let tile_count = self.dock_apps.len() + 1;
         let state = Rc::new(RefCell::new(DockState {
-            order: (0..APPS.len()).collect(),
+            order: (0..tile_count).collect(),
             wrappers: Vec::new(),
             buttons: Vec::new(),
             dots: Vec::new(),
@@ -710,7 +730,61 @@ impl ViewContent for DockPanelView {
         let sliders_launching = Rc::new(RefCell::new(false));
         let sliders_bounce_count = Rc::new(RefCell::new(0u32));
 
-        for (index, (name, _hex, letter, cmd)) in APPS.iter().enumerate() {
+        /// What a click on a tile does (captured per tile below).
+        #[derive(Clone)]
+        enum TileAction {
+            Launchpad,
+            // Real installed program: launched out-of-process.
+            Real {
+                bundle_path: std::path::PathBuf,
+                name: String,
+            },
+            // Demo fallback entry: legacy log/spawn behavior.
+            Demo {
+                name: String,
+                cmd: Option<&'static str>,
+            },
+        }
+        struct TileDef {
+            name: String,
+            fallback_letter: String,
+            item: Option<apps::AppItem>,
+            action: TileAction,
+        }
+        let launchpad_name = tr(&self.lang, "dock.app.launchpad", "Launchpad");
+        let mut tiles: Vec<TileDef> = Vec::with_capacity(self.dock_apps.len() + 1);
+        tiles.push(TileDef {
+            name: launchpad_name,
+            fallback_letter: String::from("L"),
+            item: None,
+            action: TileAction::Launchpad,
+        });
+        for item in &self.dock_apps {
+            let action = match (&item.bundle_path, item.demo_cmd) {
+                (Some(bundle_path), _) => TileAction::Real {
+                    bundle_path: bundle_path.clone(),
+                    name: item.display_name.clone(),
+                },
+                (None, cmd) => TileAction::Demo {
+                    name: item.display_name.clone(),
+                    cmd,
+                },
+            };
+            tiles.push(TileDef {
+                name: item.display_name.clone(),
+                fallback_letter: item
+                    .display_name
+                    .chars()
+                    .next()
+                    .unwrap_or('A')
+                    .to_string(),
+                item: Some(item.clone()),
+                action,
+            });
+        }
+
+        for (index, tile_def) in tiles.iter().enumerate() {
+            let name = tile_def.name.as_str();
             // wrapper = overlay so icon is perfectly centered in dock, dot is overlay below (does not affect centering)
             let wrapper = gtk::Overlay::new();
             wrapper.set_size_request(ICON_SIZE, ICON_SIZE);
@@ -718,7 +792,7 @@ impl ViewContent for DockPanelView {
             wrapper.set_halign(gtk::Align::Center);
             wrapper.set_valign(gtk::Align::Center);
             wrapper.set_overflow(gtk::Overflow::Visible);
-            if index == SEPARATOR_AFTER {
+            if self.separator_after == Some(index) {
                 wrapper.add_css_class("dock-item-sep");
             }
 
@@ -744,7 +818,7 @@ impl ViewContent for DockPanelView {
                     tile.set_child(Some(&image));
                 }
                 None => {
-                    tile.set_child(Some(&gtk::Label::new(Some(&letter.to_string()))));
+                    tile.set_child(Some(&gtk::Label::new(Some(tile_def.fallback_letter.as_str()))));
                     apply_css(
                         &tile,
                         &format!(
@@ -771,7 +845,12 @@ impl ViewContent for DockPanelView {
             // place dot 4px below icon bottom (icon 53 + 4 margin = 57)
             dot.set_margin_top(ICON_SIZE + DOT_MARGIN);
             // keep dot layout stable even when hidden (opacity 0)
-            let running = is_running_app(name);
+            // Tile 0 is the LaunchPad opener and never shows a dot.
+            let running = tile_def
+                .item
+                .as_ref()
+                .map(|item| apps::is_running(item, &self.running))
+                .unwrap_or(false);
             if !running {
                 dot.add_css_class("dock-dot-hidden");
             }
@@ -794,10 +873,9 @@ impl ViewContent for DockPanelView {
             let tile_weak = tile.downgrade();
             let wrapper_weak = wrapper.downgrade();
             let ghost_path = self.icons.get(index).and_then(|p| p.clone());
-            let letter_c = *letter;
+            let letter_c = tile_def.fallback_letter.clone();
             let idx_c = index;
-            let name_lp = *name;
-            let cmd_lp = *cmd;
+            let action_click = tile_def.action.clone();
             let timeout_id_pressed = timeout_id.clone();
             let lang_lp = self.lang.clone();
             press_gesture.connect_pressed({
@@ -827,7 +905,7 @@ impl ViewContent for DockPanelView {
                             img.set_pixel_size(ICON_SIZE);
                             s.ghost.append(&img);
                         } else {
-                            let lbl = gtk::Label::new(Some(&letter_c.to_string()));
+                            let lbl = gtk::Label::new(Some(letter_c.as_str()));
                             s.ghost.append(&lbl);
                         }
                         let (tx, ty) = if let Some(btn) = tile_weak2.upgrade() {
@@ -1007,7 +1085,7 @@ impl ViewContent for DockPanelView {
                                         if let Some(xid) =
                                             x11_place::xid_of(&surface)
                                         {
-                                            let win_w = PANEL_WIDTH + GHOST_SIZE;
+                                            let win_w = panel_width() + GHOST_SIZE;
                                             let win_h =
                                                 PANEL_HEIGHT + GHOST_SIZE + BOTTOM_GAP;
                                             x11_place::set_input_region(
@@ -1050,7 +1128,8 @@ impl ViewContent for DockPanelView {
             let tile_click = tile.clone();
             let launching_click = sliders_launching.clone();
             let cnt_click = sliders_bounce_count.clone();
-            let name_click = name.to_string();
+            let action_click = action_click.clone();
+            let all_apps_click = self.all_apps.clone();
             let lang_click = lang_lp.clone();
             press_gesture.connect_released(move |gesture, n_press, x, y| {
                 if n_press != 1 {
@@ -1115,9 +1194,9 @@ impl ViewContent for DockPanelView {
                         .and_then(|r| r.downcast::<gtk::Window>().ok())
                     {
                         let scale = win.scale_factor();
-                        let win_w = PANEL_WIDTH + GHOST_SIZE;
+                        let win_w = panel_width() + GHOST_SIZE;
                         let win_h = PANEL_HEIGHT + GHOST_SIZE + BOTTOM_GAP;
-                        let panel_x = (win_w - PANEL_WIDTH) / 2;
+                        let panel_x = (win_w - panel_width()) / 2;
                         let panel_y = win_h - PANEL_HEIGHT - BOTTOM_GAP;
                         if let Some(surface) = win.surface() {
                             if let Some(xid) = x11_place::xid_of(&surface) {
@@ -1125,13 +1204,13 @@ impl ViewContent for DockPanelView {
                                     xid,
                                     panel_x * scale,
                                     panel_y * scale,
-                                    (PANEL_WIDTH * scale) as u16,
+                                    (panel_width() * scale) as u16,
                                     (PANEL_HEIGHT * scale) as u16,
                                 );
                             }
                             let region = gtk::cairo::Region::create_rectangle(
                                 &gtk::cairo::RectangleInt::new(
-                                    panel_x, panel_y, PANEL_WIDTH, PANEL_HEIGHT,
+                                    panel_x, panel_y, panel_width(), PANEL_HEIGHT,
                                 ),
                             );
                             surface.set_input_region(&region);
@@ -1168,16 +1247,30 @@ impl ViewContent for DockPanelView {
                             return;
                         }
                     }
-                    if name_click == "Launchpad" {
-                        launchpad::show_launchpad();
+                    if matches!(action_click, TileAction::Launchpad) {
+                        launchpad::show_launchpad(all_apps_click);
                         return;
                     }
                     // Bounce on click for every app (2-3 bounces)
                     let do_bounce = |t: &gtk::Button| {
                         bounce_tile_dynamics(t);
                     };
-                    // Sliders keeps its special launch loop; others just bounce + launch
-                    if name_click == "Sliders" {
+                    match &action_click {
+                        TileAction::Launchpad => unreachable!(),
+                        TileAction::Real {
+                            bundle_path,
+                            name,
+                        } => {
+                            // Real installed program: bounce, then hand off to
+                            // the out-of-process launcher (LaunchPad daemon
+                            // temp process, fallback detached tapp).
+                            do_bounce(&tile_click);
+                            launcher::launch_app(bundle_path, name);
+                        }
+                        TileAction::Demo { name, cmd } => {
+                            // Demo fallback entries keep the legacy behavior.
+                            // Sliders keeps its special launch loop; others just bounce + launch
+                            if name == "Sliders" {
                         if *launching_click.borrow() {
                             do_bounce(&tile_click);
                             return;
@@ -1247,14 +1340,16 @@ impl ViewContent for DockPanelView {
                         );
                         return;
                     }
-                    // Generic apps: bounce then spawn
-                    do_bounce(&tile_click);
-                    match cmd_lp {
-                        Some(exe) => match std::process::Command::new(exe).spawn() {
-                            Ok(_) => println!("[dock] launched {exe} ({})", tr(&lang_click, &format!("dock.app.{}", name_click.to_lowercase()), &name_click)),
-                            Err(e) => eprintln!("[dock] spawn {exe} failed: {e}"),
-                        },
-                        None => println!("[dock] launch request: {} ({})", name_lp, tr(&lang_click, &format!("dock.app.{}", name_lp.to_lowercase()), name_lp)),
+                    // Generic demo apps: bounce then spawn
+                            do_bounce(&tile_click);
+                            match cmd {
+                                Some(exe) => match std::process::Command::new(exe).spawn() {
+                                    Ok(_) => println!("[dock] launched {exe} ({})", tr(&lang_click, &format!("dock.app.{}", name.to_lowercase()), name)),
+                                    Err(e) => eprintln!("[dock] spawn {exe} failed: {e}"),
+                                },
+                                None => println!("[dock] launch request: {} ({})", name, tr(&lang_click, &format!("dock.app.{}", name.to_lowercase()), name)),
+                            }
+                        }
                     }
                 }
             });
@@ -1267,6 +1362,32 @@ impl ViewContent for DockPanelView {
             for &idx in &s.order {
                 row.append(&s.wrappers[idx]);
             }
+        }
+
+        // Running dots follow the open-program list (CoreWindows "list opened
+        // programs"): re-query every 2 s and toggle the dot per tile.
+        // Tile 0 is the LaunchPad opener and never shows a dot.
+        {
+            let state_refresh = state.clone();
+            let mut keys: Vec<Option<apps::AppItem>> = Vec::with_capacity(self.dock_apps.len() + 1);
+            keys.push(None);
+            keys.extend(self.dock_apps.iter().cloned().map(Some));
+            glib::timeout_add_local(std::time::Duration::from_millis(2000), move || {
+                let snapshot = apps::open_snapshot();
+                let s = state_refresh.borrow();
+                for (dot, key) in s.dots.iter().zip(keys.iter()) {
+                    let running = key
+                        .as_ref()
+                        .map(|item| apps::is_running(item, &snapshot))
+                        .unwrap_or(false);
+                    if running {
+                        dot.remove_css_class("dock-dot-hidden");
+                    } else {
+                        dot.add_css_class("dock-dot-hidden");
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
         }
 
         glass.append(&left_spacer);
@@ -1432,9 +1553,9 @@ impl ViewContent for DockPanelView {
                 .and_then(|r| r.downcast::<gtk::Window>().ok())
             {
                 let scale = win.scale_factor();
-                let win_w = PANEL_WIDTH + GHOST_SIZE;
+                let win_w = panel_width() + GHOST_SIZE;
                 let win_h = PANEL_HEIGHT + GHOST_SIZE + BOTTOM_GAP;
-                let panel_x = (win_w - PANEL_WIDTH) / 2;
+                let panel_x = (win_w - panel_width()) / 2;
                 let panel_y = win_h - PANEL_HEIGHT - BOTTOM_GAP;
                 if let Some(surface) = win.surface() {
                     if let Some(xid) = x11_place::xid_of(&surface) {
@@ -1442,13 +1563,13 @@ impl ViewContent for DockPanelView {
                             xid,
                             panel_x * scale,
                             panel_y * scale,
-                            (PANEL_WIDTH * scale) as u16,
+                            (panel_width() * scale) as u16,
                             (PANEL_HEIGHT * scale) as u16,
                         );
                     }
                     let region = gtk::cairo::Region::create_rectangle(
                         &gtk::cairo::RectangleInt::new(
-                            panel_x, panel_y, PANEL_WIDTH, PANEL_HEIGHT,
+                            panel_x, panel_y, panel_width(), PANEL_HEIGHT,
                         ),
                     );
                     surface.set_input_region(&region);
@@ -1470,7 +1591,7 @@ impl ViewContent for DockPanelView {
     }
 
     fn size_that_fits(&self, _available: Size) -> Size {
-        Size::new(PANEL_WIDTH as f32, PANEL_HEIGHT as f32)
+        Size::new(panel_width() as f32, PANEL_HEIGHT as f32)
     }
 }
 
@@ -1917,7 +2038,7 @@ fn place_dock(win: &gtk::Window) {
     let (mx, my, mw, mh) = primary_monitor_rect(win);
 
     // Window includes panel + ghost overflow + bottom gap (logical)
-    let win_w: i32 = PANEL_WIDTH + GHOST_SIZE;
+    let win_w: i32 = panel_width() + GHOST_SIZE;
     let win_h: i32 = PANEL_HEIGHT + GHOST_SIZE + BOTTOM_GAP;
     let px = mx + (mw - win_w * scale) / 2;
     let py = my + mh - win_h * scale;
@@ -1930,23 +2051,23 @@ fn place_dock(win: &gtk::Window) {
             x11_place::set_position_hints(xid, px, py);
             let _ = x11_place::move_window(xid, px, py);
             // Input region: only the glass panel (physical pixels) – click-through outside
-            let panel_x = (win_w - PANEL_WIDTH) / 2;
+            let panel_x = (win_w - panel_width()) / 2;
             let panel_y = win_h - PANEL_HEIGHT - BOTTOM_GAP;
             let _ = x11_place::set_input_region(
                 xid,
                 panel_x * scale,
                 panel_y * scale,
-                (PANEL_WIDTH * scale) as u16,
+                (panel_width() * scale) as u16,
                 (PANEL_HEIGHT * scale) as u16,
             );
             let _ = x11_place::set_dock_type(xid);
             let _ = x11_place::raise_window(xid);
         }
         // GDK input region is logical
-        let panel_x = (win_w - PANEL_WIDTH) / 2;
+        let panel_x = (win_w - panel_width()) / 2;
         let panel_y = win_h - PANEL_HEIGHT - BOTTOM_GAP;
         let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(
-            panel_x, panel_y, PANEL_WIDTH, PANEL_HEIGHT,
+            panel_x, panel_y, panel_width(), PANEL_HEIGHT,
         ));
         surface.set_input_region(&region);
     }
@@ -1972,7 +2093,20 @@ fn main() {
     // generated with the active mode. Generating before resolving
     // would reuse the wrong variant after a light/dark switch.
     let appearance = Appearance::resolve();
-    let icons = generate_temp_icons(appearance);
+    // Real programs via CoreWindows: first N pinned in the dock, everything
+    // in the LaunchPad. Empty install -> demo fallback tiles.
+    let loaded = apps::load();
+    if std::env::var("DOCK_DEBUG").is_ok() {
+        println!(
+            "[dock] programs: {} installed ({} pinned){}",
+            loaded.all.len(),
+            loaded.dock.len(),
+            if loaded.demo_mode { " [demo fallback]" } else { "" }
+        );
+    }
+    set_tile_count(loaded.dock.len() + 1);
+    let icons = generate_temp_icons(appearance, &loaded.dock);
+    let running = apps::open_snapshot();
     // Prewarm Launchpad icon cache on the main loop (idle, one icon per tick)
     // so the first open is fast even after /tmp was cleared. Main thread only:
     // CoreIcon ASSETS_DIR is `static mut`, a background thread would race.
@@ -2001,7 +2135,7 @@ fn main() {
             match backdrop::generate(
                 &wp,
                 monitor,
-                PANEL_WIDTH,
+                panel_width(),
                 PANEL_HEIGHT,
                 PANEL_RADIUS,
                 BOTTOM_GAP,
@@ -2011,12 +2145,12 @@ fn main() {
                 Some(p) => Some(p),
                 None => {
                     eprintln!("[dock] backdrop generation failed for {wp} -> fallback");
-                    backdrop::generate_fallback(PANEL_WIDTH, PANEL_HEIGHT, PANEL_RADIUS, appearance, &out)
+                    backdrop::generate_fallback(panel_width(), PANEL_HEIGHT, PANEL_RADIUS, appearance, &out)
                 }
             }
         } else {
             eprintln!("[dock] no wallpaper found -> fallback gradient");
-            backdrop::generate_fallback(PANEL_WIDTH, PANEL_HEIGHT, PANEL_RADIUS, appearance, &out)
+            backdrop::generate_fallback(panel_width(), PANEL_HEIGHT, PANEL_RADIUS, appearance, &out)
                 .or_else(|| {
                     eprintln!("[dock] fallback also failed, using CSS gradient only");
                     None
@@ -2025,8 +2159,13 @@ fn main() {
     };
 
     let mut app = App::new("Dock", 320, 240);
+    let separator_after = if loaded.demo_mode { Some(4) } else { None };
     app.set_root(DockRoot(DockPanelView {
         icons,
+        dock_apps: loaded.dock,
+        all_apps: loaded.all,
+        running,
+        separator_after,
         appearance,
         backdrop,
         lang,
