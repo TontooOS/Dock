@@ -47,7 +47,9 @@ override (`src/main.rs:35`).
 ## Temp Icon Generation
 
 Each tile PNG is generated at startup with the CoreIcon generator
-(`IconCanvas`) into `/tmp/tontoo-dock-<app>-v3.png` (`src/main.rs:250`):
+(`IconCanvas`) into `/tmp/tontoo-dock-<app>-<light|dark>-v3.png`
+(`src/main.rs:250`). Every icon is cached twice, once per appearance, so
+switching light/dark never reuses the wrong variant (`cache_suffix()`):
 
 - Background: top-to-bottom gradient of the app color (28 % lighter at top,
   10 % darker at bottom)
@@ -55,7 +57,18 @@ Each tile PNG is generated at startup with the CoreIcon generator
 - `specular(0.15)` + `inner_depth(30, 0.30)`
 - White SF Symbol centered at 600x600 px
 - Launchpad uses raster `Resources/launchpad.png` through
-  `IconCanvas::dark_light_mode` (`src/main.rs:300`)
+  `build_launchpad_image()` (`src/main.rs`): light renders via
+  `IconCanvas::dark_light_mode(Light)`, dark flattens the source over opaque
+  white first and then swaps the background to the dark preset with the same
+  glass finish. The flatten step is required because the source has a
+  transparent border, which defeats CoreIcon's border-seeded flood fill (it
+  would silently keep the white background). Cached as
+  `/tmp/tontoo-dock-launchpad-<light|dark>-v6.png`
+
+Appearance is resolved via `Appearance::resolve()` before icon generation
+(`src/main.rs:1935`), honoring `DOCK_APPEARANCE=light|dark` with
+`ColorScheme::detect_system()` fallback, so the correct cache variant is
+generated on startup.
 
 If generation fails the tile falls back to a letter tile (`src/main.rs:595`).
 
@@ -87,7 +100,11 @@ The panel CSS also has a fallback linear gradient when `backdrop` is `None`
 
 Icons remain at a fixed `56` px size – hover magnification is disabled per
 user request (previously a cosine falloff with `1.55` peak scale). Hover only
-shows the tooltip label (`dock-hover-label`) without scaling.
+shows the native GTK tooltip (`tile.set_tooltip_text`) after the GTK4 default
+delay – no custom hover label is rendered. No explicit timeout is set in
+`main()`: the GTK3 `gtk-tooltip-timeout` / `gtk-tooltip-browse-timeout`
+`GtkSettings` properties do not exist on GTK4 and setting them panics with
+`property 'gtk-tooltip-timeout' of type 'GtkSettings' not found`.
 
 ### Running Indicators (src/main.rs:381)
 
@@ -150,6 +167,10 @@ placeholder logic stays simple.
 
 ## Window Setup & Robustness
 
+The UIKit root uses `App::no_window_bar()` (no traffic lights / drag area)
+plus `App::no_window_frame()` (no UIKit margin, corner radius, border or
+shadow) – the dock draws its own glass panel on a fully transparent window.
+
 ### Input Region & Click-Through (src/main.rs:1839)
 
 The transparent GTK window covers `PANEL_WIDTH+GHOST_SIZE` ×
@@ -183,8 +204,7 @@ cannot override the position.
 
 - Fonts: SF Pro Display loaded from `/usr/share/fonts/OTF` + `/TTF`
   (`BaseOS/fonts/SF-Pro/`). Global CSS forces
-  `font-family: 'SF Pro Display', 'SF Pro Text'` (`src/main.rs:466`) and
-  hover labels use `SF Pro Display` 12 px (`src/main.rs:530`).
+  `font-family: 'SF Pro Display', 'SF Pro Text'` (`src/main.rs:466`).
 - Languages: `lang/en_us.json` and `lang/de_de.json` (
   `AGENTS.md`). Loaded via `load_lang()` (`src/main.rs:78`) based on
   `LANG`/`LC_ALL` (contains `de` → `de_de`). Tooltips and launch logs use

@@ -48,15 +48,26 @@ impl Appearance {
                 _ => {}
             }
         }
-        match ColorScheme::detect_system() {
-            ColorScheme::Light => Self::Light,
-            ColorScheme::Dark => Self::Dark,
-        }
+        Self::from_color_scheme(ColorScheme::detect_system())
     }
     fn from_color_scheme(cs: ColorScheme) -> Self {
         match cs {
             ColorScheme::Light => Self::Light,
             ColorScheme::Dark => Self::Dark,
+        }
+    }
+    /// Cache key suffix: every icon is cached twice (`-light` / `-dark`)
+    /// so switching appearance never reuses the wrong variant.
+    fn cache_suffix(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+    fn to_color_scheme(self) -> ColorScheme {
+        match self {
+            Self::Light => ColorScheme::Light,
+            Self::Dark => ColorScheme::Dark,
         }
     }
     /// macOS-accurate materials:
@@ -232,6 +243,10 @@ const COREICON_ASSETS: &str = concat!(
 );
 const ICON_CORNER_RADIUS: f32 = 250.0;
 const ICON_GEN_VERSION: u32 = 3;
+/// Cache version of the Launchpad tile. Bumped when the dark pipeline changed
+/// (flatten-over-white + flood fill): v5 `-dark-` files still contain the
+/// broken all-white render and must never be reused.
+const LAUNCHPAD_GEN_VERSION: u32 = 6;
 const LAUNCHPAD_SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Resources/launchpad.png");
 
 const APPS: &[(&str, &str, SFSymbol, Option<&str>)] = &[
@@ -258,15 +273,21 @@ fn shade(c: IconColor, amount: f32) -> IconColor {
     IconColor::new(mix(c.r), mix(c.g), mix(c.b), 1.0)
 }
 
-fn generate_app_icon(name: &str, hex: &str, symbol: SFSymbol) -> Option<String> {
+fn generate_app_icon(
+    name: &str,
+    hex: &str,
+    symbol: SFSymbol,
+    appearance: Appearance,
+) -> Option<String> {
     if name == "Launchpad" {
-        return generate_launchpad_icon();
+        return generate_launchpad_icon(appearance);
     }
     let base = IconColor::from_hex(hex)?;
     let path = std::env::temp_dir()
         .join(format!(
-            "tontoo-dock-{}-v{}.png",
+            "tontoo-dock-{}-{}-v{}.png",
             name.to_lowercase(),
+            appearance.cache_suffix(),
             ICON_GEN_VERSION
         ))
         .into_os_string()
@@ -274,7 +295,7 @@ fn generate_app_icon(name: &str, hex: &str, symbol: SFSymbol) -> Option<String> 
         .ok()?;
     if std::path::Path::new(&path).is_file() {
         if std::env::var("DOCK_DEBUG").is_ok() {
-            println!("[dock] icon cached: {path}");
+            println!("[dock] icon cached ({}): {path}", appearance.cache_suffix());
         }
         return Some(path);
     }
@@ -304,32 +325,109 @@ fn generate_app_icon(name: &str, hex: &str, symbol: SFSymbol) -> Option<String> 
     }
 }
 
-fn generate_launchpad_icon() -> Option<String> {
+/// Render the Launchpad tile for `appearance` without touching the cache.
+///
+/// Light uses `dark_light_mode(Light)` (source background is already white).
+/// Dark must NOT use `dark_light_mode(Dark)`: its flood fill derives the
+/// background color from the outermost border pixels, but
+/// `Resources/launchpad.png` has a transparent border (RGBA 0,0,0,0), so the
+/// reference color becomes near-black, no pixel matches, the mask stays empty
+/// and the tile silently keeps its white background. Instead the source is
+/// first flattened over opaque white (its antialiased edge is white-on-
+/// transparent, so this matches its visible shape) and then run through the
+/// same flood-fill background swap – the depth finish is identical to light.
+fn build_launchpad_image(
+    appearance: Appearance,
+) -> Result<image::RgbaImage, Box<dyn std::error::Error>> {
+    use CoreIcon::generator::{DepthOptions, ProcessOptions, Shadow};
+    use image::imageops::FilterType;
+    match appearance {
+        Appearance::Light => IconCanvas::dark_light_mode(
+            LAUNCHPAD_SRC,
+            CoreIcon::generator::IconMode::Light,
+            ICON_CORNER_RADIUS,
+            Some(0.0),
+            Some(8.0),
+            Some(18.0),
+            Some(0.28),
+            Some(28.0),
+            Some(0.28),
+            Some(0.15),
+            Some(6.0),
+            Some(0.32),
+        ),
+        Appearance::Dark => {
+            // Same glass finish as the light tile, only the background differs.
+            let depth = DepthOptions::new(ICON_CORNER_RADIUS)
+                .shadow(Shadow::new().offset(0.0, 8.0).blur(18.0).opacity(0.28))
+                .inner_depth(28.0, 0.28)
+                .specular(0.15)
+                .edge_highlight(6.0, 0.32);
+            let src = image::open(LAUNCHPAD_SRC)?;
+            let scaled = src
+                .resize(
+                    CoreIcon::generator::CANVAS_SIZE,
+                    CoreIcon::generator::CANVAS_SIZE,
+                    FilterType::Lanczos3,
+                )
+                .to_rgba8();
+            // Flatten over white so the flood fill sees the opaque shape
+            // `dark_light_mode` would see on a white canvas.
+            let mut flat = image::RgbaImage::from_pixel(
+                scaled.width(),
+                scaled.height(),
+                image::Rgba([255, 255, 255, 255]),
+            );
+            for (x, y, p) in scaled.enumerate_pixels() {
+                if p[3] == 0 {
+                    continue;
+                }
+                if p[3] == 255 {
+                    flat.put_pixel(x, y, *p);
+                } else {
+                    let a = p[3] as f32 / 255.0;
+                    flat.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([
+                            (p[0] as f32 * a + 255.0 * (1.0 - a)).round() as u8,
+                            (p[1] as f32 * a + 255.0 * (1.0 - a)).round() as u8,
+                            (p[2] as f32 * a + 255.0 * (1.0 - a)).round() as u8,
+                            255,
+                        ]),
+                    );
+                }
+            }
+            Ok(IconCanvas::process_image(
+                &flat,
+                &ProcessOptions {
+                    recolor: None,
+                    background_replace: Some(CoreIcon::generator::DARK_BACKGROUND),
+                    depth,
+                    ..Default::default()
+                },
+            ))
+        }
+    }
+}
+
+fn generate_launchpad_icon(appearance: Appearance) -> Option<String> {
     let out = std::env::temp_dir()
-        .join("tontoo-dock-launchpad-v5.png")
+        .join(format!(
+            "tontoo-dock-launchpad-{}-v{}.png",
+            appearance.cache_suffix(),
+            LAUNCHPAD_GEN_VERSION
+        ))
         .into_os_string()
         .into_string()
         .ok()?;
     if std::path::Path::new(&out).is_file() {
         if std::env::var("DOCK_DEBUG").is_ok() {
-            println!("[dock] icon cached: {out}");
+            println!("[dock] icon cached ({}): {out}", appearance.cache_suffix());
         }
         return Some(out);
     }
-    let res = IconCanvas::dark_light_mode(
-        LAUNCHPAD_SRC,
-        CoreIcon::generator::IconMode::Light,
-        ICON_CORNER_RADIUS,
-        Some(0.0),
-        Some(8.0),
-        Some(18.0),
-        Some(0.28),
-        Some(28.0),
-        Some(0.28),
-        Some(0.15),
-        Some(6.0),
-        Some(0.32),
-    );
+    let res = build_launchpad_image(appearance);
     match res {
         Ok(img) => match img.save(&out) {
             Ok(()) => Some(out),
@@ -345,14 +443,15 @@ fn generate_launchpad_icon() -> Option<String> {
     }
 }
 
-fn generate_temp_icons() -> Vec<Option<String>> {
+fn generate_temp_icons(appearance: Appearance) -> Vec<Option<String>> {
     unsafe { ASSETS_DIR = COREICON_ASSETS };
-    APPS
-        .iter()
-        .map(|(name, hex, symbol, _cmd)| match generate_app_icon(name, hex, *symbol) {
-            Some(path) => Some(path),
-            None => None,
-        })
+    APPS.iter()
+        .map(
+            |(name, hex, symbol, _cmd)| match generate_app_icon(name, hex, *symbol, appearance) {
+                Some(path) => Some(path),
+                None => None,
+            },
+        )
         .collect()
 }
 
@@ -469,16 +568,8 @@ impl ViewContent for DockPanelView {
             suppress_click: false,
         }));
 
-        let hover_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        hover_box.add_css_class("dock-hover-label");
-        hover_box.set_visible(false);
-        hover_box.set_halign(gtk::Align::Start);
-        hover_box.set_valign(gtk::Align::Start);
-        hover_box.set_overflow(gtk::Overflow::Visible);
-        let hover_label = gtk::Label::new(None);
-        hover_label.add_css_class("dock-hover-label-text");
-        hover_box.append(&hover_label);
-        // overlay order fixed later – hover_box on top of dock
+        // Native GTK tooltip (`tile.set_tooltip_text`) shows the app name
+        // after a short delay with system styling – no custom hover label.
 
         let material = self.appearance.material();
         // Decide panel background: if backdrop PNG exists use its baked image (tint already inside),
@@ -583,20 +674,6 @@ impl ViewContent for DockPanelView {
             button:focus, button:active {{
                 outline: none;
                 box-shadow: none;
-            }}
-            .dock-hover-label {{
-                background: rgba(30,30,30,0.88);
-                border-radius: 6px;
-                padding: 5px 9px;
-                box-shadow: 0 4px 16px rgba(0,0,0,0.35);
-                border: 1px solid rgba(255,255,255,0.08);
-            }}
-            .dock-hover-label-text {{
-                color: white;
-                font-family: '{sf}';
-                font-size: 12px;
-                font-weight: 500;
-                letter-spacing: 0.1px;
             }}
             @keyframes dock-spring {{
                 0% {{ transform: translateY(0) scale(1); }}
@@ -705,37 +782,6 @@ impl ViewContent for DockPanelView {
             }
 
             wrapper.add_overlay(&dot);
-
-            // keep wrappers list in order for drag; row will be filled later
-            // Hover is handled globally via magnification motion, but keep tooltip hover label
-            {
-                let hover = gtk::EventControllerMotion::new();
-                let tile_h = tile.clone();
-                let hb = hover_box.clone();
-                let hl = hover_label.clone();
-                let top_o = top_overlay.clone();
-                let state_h = state.clone();
-                let disp_name = localized.clone();
-                hover.connect_enter(move |_, _, _| {
-                    if state_h.borrow().dragging.is_some() {
-                        return;
-                    }
-                    hl.set_label(&disp_name);
-                    let text_w = (disp_name.len() as i32 * 7 + 20).max(60);
-                    if let Some((tx, ty)) = tile_h.translate_coordinates(&top_o, 0.0, 0.0) {
-                        let x = tx as i32 + ICON_SIZE / 2 - text_w / 2;
-                        let y = ty as i32 - 34;
-                        hb.set_margin_start(x);
-                        hb.set_margin_top(y);
-                    }
-                    hb.set_visible(true);
-                });
-                let hb2 = hover_box.clone();
-                hover.connect_leave(move |_| {
-                    hb2.set_visible(false);
-                });
-                tile.add_controller(hover);
-            }
 
             // Click + long-press drag
             let press_gesture = gtk::GestureClick::new();
@@ -1228,8 +1274,7 @@ impl ViewContent for DockPanelView {
         glass.append(&right_spacer);
         overlay.add_overlay(&glass);
         top_overlay.add_overlay(&overlay);
-        // correct stacking: dock at bottom, then hover label, then placeholder above dock, then ghost on very top
-        top_overlay.add_overlay(&hover_box);
+        // correct stacking: dock at bottom, then placeholder above dock, then ghost on very top
         top_overlay.add_overlay(&placeholder_above);
         top_overlay.add_overlay(&ghost);
 
@@ -1922,7 +1967,12 @@ fn main() {
     }
 
     let lang = load_lang();
-    let icons = generate_temp_icons();
+    // Resolve appearance FIRST: icons are cached per appearance
+    // (`tontoo-dock-<app>-<light|dark>-vN.png`), so they must be
+    // generated with the active mode. Generating before resolving
+    // would reuse the wrong variant after a light/dark switch.
+    let appearance = Appearance::resolve();
+    let icons = generate_temp_icons(appearance);
     // Prewarm Launchpad icon cache on the main loop (idle, one icon per tick)
     // so the first open is fast even after /tmp was cleared. Main thread only:
     // CoreIcon ASSETS_DIR is `static mut`, a background thread would race.
@@ -1935,9 +1985,6 @@ fn main() {
             }
         });
     });
-    let sys_scheme = ColorScheme::detect_system();
-    let appearance = Appearance::from_color_scheme(sys_scheme);
-
     let monitor = x11_place::primary_monitor().unwrap_or((0, 0, 1920, 1080));
     // Try wallpaper backdrop, fallback to gradient (never empty)
     let backdrop = {
@@ -1985,7 +2032,13 @@ fn main() {
         lang,
     }));
     app.no_window_bar();
-    app.set_color_scheme(sys_scheme);
+    app.no_window_frame();
+    app.set_color_scheme(appearance.to_color_scheme());
+    // Native tile tooltips (`set_tooltip_text`) use the GTK4 default hover
+    // delay. NOTE: GTK3 `gtk-tooltip-timeout` / `gtk-tooltip-browse-timeout`
+    // do NOT exist on GTK4 `GtkSettings` - setting them panics with
+    // "property 'gtk-tooltip-timeout' of type 'GtkSettings' not found".
+    // So no explicit timeout is pinned here.
 
     let mut ticks = 0u32;
     glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
@@ -2031,4 +2084,71 @@ fn main() {
     });
 
     app.run();
+}
+
+#[cfg(test)]
+mod icon_mode_tests {
+    use super::*;
+
+    fn stats(img: &image::RgbaImage) -> (f64, f64, u32) {
+        let total = (img.width() * img.height()) as f64;
+        let mut white = 0u64;
+        let mut dark_bg = 0u64;
+        let mut saturated = 0u32;
+        for (_, _, p) in img.enumerate_pixels() {
+            if p[3] < 200 {
+                continue;
+            }
+            let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+            if r > 200 && g > 200 && b > 200 {
+                white += 1;
+            }
+            if (r - 33).abs() < 30 && (g - 33).abs() < 30 && (b - 38).abs() < 30 {
+                dark_bg += 1;
+            }
+            if (r - g).abs() > 60 || (r - b).abs() > 60 || (g - b).abs() > 60 {
+                saturated += 1;
+            }
+        }
+        (white as f64 / total, dark_bg as f64 / total, saturated)
+    }
+
+    #[test]
+    fn dark_launchpad_tile_has_dark_background() {
+        // Regression: `dark_light_mode(Dark)` flood fill derives the background
+        // from transparent border pixels of `Resources/launchpad.png`, matches
+        // nothing and silently keeps the white background.
+        let img =
+            build_launchpad_image(Appearance::Dark).expect("dark launchpad render");
+        assert_eq!((img.width(), img.height()), (1024, 1024));
+        let (white_frac, dark_frac, saturated) = stats(&img);
+        assert!(
+            white_frac < 0.05,
+            "dark tile still has white background (white_frac={white_frac:.3})"
+        );
+        assert!(
+            dark_frac > 0.20,
+            "dark background missing (dark_frac={dark_frac:.3})"
+        );
+        assert!(
+            saturated > 5000,
+            "artwork colors lost in dark tile (saturated={saturated})"
+        );
+    }
+
+    #[test]
+    fn light_launchpad_tile_stays_light() {
+        let img =
+            build_launchpad_image(Appearance::Light).expect("light launchpad render");
+        assert_eq!((img.width(), img.height()), (1024, 1024));
+        let (white_frac, _, saturated) = stats(&img);
+        assert!(
+            white_frac > 0.15,
+            "light tile lost its white background (white_frac={white_frac:.3})"
+        );
+        assert!(
+            saturated > 5000,
+            "artwork colors lost in light tile (saturated={saturated})"
+        );
+    }
 }

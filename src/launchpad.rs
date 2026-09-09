@@ -14,21 +14,8 @@ use crate::CoreIcon::{
     TERMINAL_FILL,
 };
 
-const COREICON_ASSETS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../TontooLibs/CoreIcon/assets/icons"
-);
 const ICON_CORNER_RADIUS: f32 = 250.0;
 const ICON_GEN_VERSION: u32 = 2;
-const GHOST_SIZE_LP: i32 = 96;
-const GROW_DELAY_MS: u64 = 500;
-const GROW_MS: u64 = 150;
-const POP_SCALE: f32 = 1.65;
-const POP_MS: u64 = 180;
-
-fn rgba(c: (u8, u8, u8), a: f64) -> String {
-    format!("rgba({}, {}, {}, {})", c.0, c.1, c.2, a)
-}
 
 fn shade(c: IconColor, amount: f32) -> IconColor {
     let mix = |v: f32| {
