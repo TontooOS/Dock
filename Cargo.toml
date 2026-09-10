@@ -11,7 +11,7 @@ name = "dock"
 path = "src/main.rs"
 
 [dependencies]
-sdk = { path = "/Library/System/sdk", features = ["UIKit", "CoreIcon", "UIKitDynamics", "TontooUI", "CoreWindows"] }
+sdk = { path = "/Library/System/sdk", features = ["UIKit", "CoreIcon", "UIKitDynamics", "TontooUI", "CoreWindows", "CoreData"] }
 gtk = { package = "gtk4", version = "0.9" }
 glib = "0.20"
 image = "0.25"

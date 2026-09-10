@@ -48,8 +48,10 @@ override (`src/main.rs:35`).
 
 Installed programs come from CoreWindows `list_programs()`
 (`~/Applications` + `/Applications`, sorted by display name;
-`src/apps.rs`). The dock pins the first `DOCK_APP_COUNT = 5` entries
-after the LaunchPad tile; the LaunchPad shows every installed program.
+`src/apps.rs`). The dock shows the user's CoreData pins in pin order
+(`src/pins.rs`, entity `DockPin` under `com.tontoo.dock`); first run
+materializes the first `DOCK_APP_COUNT = 5` entries as pins. The
+LaunchPad shows every installed program.
 Tile icons prefer the bundle icon file (`AppEntry.icon.icon_path`,
 used as-is); programs without a bundle icon get a generated CoreIcon
 gradient tile keyed by bundle id (`tontoo-dock-<bundle>-<light|dark>-v3.png`).
@@ -244,7 +246,6 @@ via the overlay `GestureClick` restores panel-only input and suppresses the
 follow-up click for 50 ms.
 
 ## Launching (src/launcher.rs)
-
 Clicking a tile never runs app code inside the dock. `launcher::launch_app()`
 hands the bundle path to a detached helper on a throwaway thread (the GTK
 main loop is never blocked):
@@ -264,6 +265,18 @@ decides per click — visible windows of the app minimize
 LaunchPad tiles launch and close the grid macOS-style. Demo entries
 without a bundle only log (Sliders keeps its legacy `vlc` launch loop).
 
+`launcher::open_in_finder()` reveals a bundle in the file manager
+(`tapp <Finder.app> -- <dir>`, else `xdg-open <dir>`).
+
+## Pins (src/pins.rs)
+
+Dock membership is stored per user in CoreData (`com.tontoo.dock`,
+entity `DockPin` with `bundle_id` + `position`, plus a `DockMeta`
+marker so an explicitly emptied dock stays empty). New pins append far
+right. A version counter lets the running dock rebuild its row live
+(500 ms watch, deferred while dragging, panel re-placed afterwards);
+unavailable CoreData falls back to unpinned defaults without saving.
+
 ## Launchpad
 
 Launchpad (`src/launchpad.rs` `show_launchpad(items)`) opens centered
@@ -271,6 +284,13 @@ Launchpad (`src/launchpad.rs` `show_launchpad(items)`) opens centered
 input falls back to the demo grid). Background follows the system spec:
 light `rgba(236,236,236,0.90)` (`#ececec`), dark `rgba(29,29,29,0.90)`
 (`#1d1d1d`), plus `blur(24px) saturate(180%)`.
+
+### Context Menu
+
+Right-clicking a tile opens a popover menu: Open (launches and closes
+the grid), a divider, Open In Finder (reveals the bundle), and Pin to
+Dock — or Remove from Dock when already pinned (real programs only).
+Pin changes save to CoreData and appear live in the dock (see Pins).
 
 ### Async Icon Loading
 
@@ -292,7 +312,6 @@ No `set_visible(true)` before content exists, so no empty transparent frame
 is shown.
 
 ### Cache Prewarm (src/launchpad.rs, src/main.rs)
-
 `launchpad::prewarm_step()` generates one missing cache file per call without
 GTK calls over the real program list (loaded once via `OnceLock`; demo grid
 when nothing is installed). Bundle icons need no warming. `main()` schedules

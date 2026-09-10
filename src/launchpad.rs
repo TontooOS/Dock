@@ -252,6 +252,92 @@ fn placeholder_tile(col: &str, name: &str) -> gtk::Box {
     icon_box
 }
 
+/// Right-click context menu for one app tile: Open, a divider,
+/// Open In Finder, and Pin to Dock (or Remove from Dock when pinned).
+/// Pin changes save per user to CoreData and appear live in the dock.
+fn show_app_menu(parent: &gtk::Button, item: &AppItem, win: &gtk::Window, x: f64, y: f64) {
+    let popover = gtk::Popover::new();
+    popover.set_parent(parent);
+    popover.set_autohide(true);
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+        x as i32,
+        y as i32,
+        1,
+        1,
+    )));
+
+    let css = gtk::CssProvider::new();
+    css.load_from_string(
+        ".launchpad-menu { background-color: rgba(40,40,42,0.96); border-radius: 10px; padding: 4px; } \
+         .launchpad-menu button { font-family: 'SF Pro Display'; font-size: 12px; color: #f5f5f7; background: transparent; border: none; border-radius: 6px; padding: 6px 12px; } \
+         .launchpad-menu button:hover { background-color: rgba(255,255,255,0.12); } \
+         .launchpad-menu separator { background: rgba(255,255,255,0.12); min-height: 1px; margin: 4px 8px; }",
+    );
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    vbox.add_css_class("launchpad-menu");
+    vbox.style_context()
+        .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 20);
+
+    fn menu_row(vbox: &gtk::Box, label: &str) -> gtk::Button {
+        let button = gtk::Button::with_label(label);
+        button.set_has_frame(false);
+        button.set_halign(gtk::Align::Fill);
+        vbox.append(&button);
+        button
+    }
+
+    // Open: launch out-of-process, close the grid macOS-style.
+    {
+        let item_c = item.clone();
+        let win_c = win.clone();
+        let pop_c = popover.clone();
+        menu_row(&vbox, "Open").connect_clicked(move |_| {
+            pop_c.popdown();
+            if let Some(bundle_path) = item_c.bundle_path.as_deref() {
+                crate::launcher::launch_app(bundle_path, &item_c.display_name);
+                win_c.close();
+            } else {
+                println!("[launchpad] open {}", item_c.display_name);
+            }
+        });
+    }
+    // Divider.
+    vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    // Open In Finder: reveal the bundle in the file manager.
+    {
+        let item_c = item.clone();
+        let pop_c = popover.clone();
+        menu_row(&vbox, "Open In Finder").connect_clicked(move |_| {
+            pop_c.popdown();
+            if let Some(bundle_path) = item_c.bundle_path.as_deref() {
+                crate::launcher::open_in_finder(bundle_path);
+            } else {
+                println!(
+                    "[launchpad] reveal {} (demo entry, no bundle)",
+                    item_c.display_name
+                );
+            }
+        });
+    }
+    // Pin to Dock / Remove from Dock (real programs only).
+    if item.bundle_path.is_some() {
+        let item_c = item.clone();
+        let pop_c = popover.clone();
+        let label = if crate::pins::is_pinned(&item.bundle_id) {
+            "Remove from Dock"
+        } else {
+            "Pin to Dock"
+        };
+        menu_row(&vbox, label).connect_clicked(move |_| {
+            pop_c.popdown();
+            crate::pins::toggle(&item_c);
+        });
+    }
+
+    popover.set_child(Some(&vbox));
+    popover.popup();
+}
+
 /// Open the LaunchPad grid for `items` (all installed programs).
 /// An empty list shows the demo grid instead.
 pub fn show_launchpad(items: Vec<AppItem>) {
@@ -502,6 +588,19 @@ pub fn show_launchpad(items: Vec<AppItem>) {
                     println!("[launchpad] clicked {} (no drag)", item_c.display_name);
                 }
             });
+        }
+        // Right-click context menu: Open / Open In Finder / Pin to Dock
+        // (or Remove from Dock when already pinned).
+        {
+            let right = gtk::GestureClick::new();
+            right.set_button(3);
+            let item_c = item.clone();
+            let btn_c = btn.clone();
+            let win_c = win.clone();
+            right.connect_pressed(move |_, _, x, y| {
+                show_app_menu(&btn_c, &item_c, &win_c, x, y);
+            });
+            btn.add_controller(right);
         }
     }
 

@@ -55,7 +55,7 @@ pub const DEMO_PROGRAMS: &[(&str, &str, SFSymbol, Option<&str>)] = &[
 
 /// Everything the dock and the LaunchPad need for one startup.
 pub struct LoadedApps {
-    /// The pinned dock programs (at most [`DOCK_APP_COUNT`]).
+    /// The pinned dock programs, in pin order.
     pub dock: Vec<AppItem>,
     /// All installed programs (dock programs first, then the rest).
     pub all: Vec<AppItem>,
@@ -63,7 +63,9 @@ pub struct LoadedApps {
     pub demo_mode: bool,
 }
 
-/// Load installed programs via CoreWindows, falling back to demo data.
+/// Load installed programs via CoreWindows with the user's CoreData pins.
+/// First run materializes the default pins (first [`DOCK_APP_COUNT`]);
+/// an explicitly emptied dock stays empty.
 pub fn load() -> LoadedApps {
     let all: Vec<AppItem> = crate::CoreWindows::list_programs()
         .into_iter()
@@ -76,11 +78,21 @@ pub fn load() -> LoadedApps {
             demo_mode: true,
         };
     }
-    let dock = all.iter().take(DOCK_APP_COUNT).cloned().collect();
-    LoadedApps {
-        dock,
-        all,
-        demo_mode: false,
+    match crate::pins::load(&all) {
+        Some(dock) => LoadedApps {
+            dock,
+            all,
+            demo_mode: false,
+        },
+        None => {
+            let dock: Vec<AppItem> = all.iter().take(DOCK_APP_COUNT).cloned().collect();
+            crate::pins::save(&dock);
+            LoadedApps {
+                dock,
+                all,
+                demo_mode: false,
+            }
+        }
     }
 }
 

@@ -22,6 +22,7 @@ mod backdrop;
 mod bridge;
 mod launchpad;
 mod launcher;
+mod pins;
 
 /// Border width / color
 const BORDER_WIDTH: i32 = 1;
@@ -518,14 +519,25 @@ fn launch_item(item: &apps::AppItem) {
     }
 }
 
+/// Dots-refresh keys for a tile row: `None` for the LaunchPad opener,
+// shared so pin rebuilds stay exact.
+fn tile_keys_for(dock_apps: &[apps::AppItem]) -> Vec<Option<apps::AppItem>> {
+    let mut keys = Vec::with_capacity(dock_apps.len() + 1);
+    keys.push(None);
+    keys.extend(dock_apps.iter().cloned().map(Some));
+    keys
+}
+
 // ── Dock panel view ────────────────────────────────────────────────────
-struct DockPanelView {
-    /// Tile icons aligned with the tiles: `[launchpad, app0, app1, ...]`.
-    icons: Vec<Option<String>>,
+/// Shared dock content, reloaded live when pins change (see the pins-watch
+/// timeout in `render`). Everything tile-related reads from here.
+struct DockData {
     /// Pinned programs (without the LaunchPad tile).
     dock_apps: Vec<apps::AppItem>,
     /// All installed programs, opened in the LaunchPad.
     all_apps: Vec<apps::AppItem>,
+    /// Tile icons aligned with the tiles: `[launchpad, app0, app1, ...]`.
+    icons: Vec<Option<String>>,
     /// Open-program snapshot for the running dots.
     running: apps::OpenSnapshot,
     /// Separator tile index (`Some(4)` in demo mode, `None` with real data).
@@ -533,6 +545,52 @@ struct DockPanelView {
     appearance: Appearance,
     backdrop: Option<String>,
     lang: HashMap<String, String>,
+}
+
+struct DockPanelView {
+    data: Rc<RefCell<DockData>>,
+}
+
+#[derive(Clone)]
+struct DragState {
+    src_pos: usize,
+    src_index: usize,
+}
+
+struct DockState {
+    order: Vec<usize>,
+    wrappers: Vec<gtk::Overlay>,
+    buttons: Vec<gtk::Button>,
+    dots: Vec<gtk::Box>,
+    row: gtk::Box,
+    ghost: gtk::Box,
+    overlay: gtk::Overlay,
+    top_overlay: gtk::Overlay,
+    placeholder: gtk::Box,
+    placeholder_above: gtk::Box,
+    dragging: Option<DragState>,
+    suppress_click: bool,
+}
+
+/// What a click on a tile does (captured per tile in `build_row`).
+#[derive(Clone)]
+enum TileAction {
+    Launchpad,
+    // Real installed program: click toggles minimize/restore,
+    // launches when not running.
+    Real { item: apps::AppItem },
+    // Demo fallback entry: legacy log/spawn behavior.
+    Demo {
+        name: String,
+        cmd: Option<&'static str>,
+    },
+}
+
+struct TileDef {
+    name: String,
+    fallback_letter: String,
+    item: Option<apps::AppItem>,
+    action: TileAction,
 }
 
 impl ViewContent for DockPanelView {
@@ -555,7 +613,7 @@ impl ViewContent for DockPanelView {
         overlay.set_margin_bottom(BOTTOM_GAP);
         overlay.set_overflow(gtk::Overflow::Visible);
 
-        if let Some(path) = &self.backdrop {
+        if let Some(path) = &self.data.borrow().backdrop {
             let img = gtk::Image::from_file(path);
             img.set_halign(gtk::Align::Fill);
             img.set_valign(gtk::Align::Fill);
@@ -596,26 +654,7 @@ impl ViewContent for DockPanelView {
         placeholder_above.set_visible(false);
         // overlay order fixed later – placeholder_above on top of dock
 
-        #[derive(Clone)]
-        struct DragState {
-            src_pos: usize,
-            src_index: usize,
-        }
-        struct DockState {
-            order: Vec<usize>,
-            wrappers: Vec<gtk::Overlay>,
-            buttons: Vec<gtk::Button>,
-            dots: Vec<gtk::Box>,
-            row: gtk::Box,
-            ghost: gtk::Box,
-            overlay: gtk::Overlay,
-            top_overlay: gtk::Overlay,
-            placeholder: gtk::Box,
-            placeholder_above: gtk::Box,
-            dragging: Option<DragState>,
-            suppress_click: bool,
-        }
-        let tile_count = self.dock_apps.len() + 1;
+        let tile_count = self.data.borrow().dock_apps.len() + 1;
         let state = Rc::new(RefCell::new(DockState {
             order: (0..tile_count).collect(),
             wrappers: Vec::new(),
@@ -634,10 +673,10 @@ impl ViewContent for DockPanelView {
         // Native GTK tooltip (`tile.set_tooltip_text`) shows the app name
         // after a short delay with system styling – no custom hover label.
 
-        let material = self.appearance.material();
+        let material = self.data.borrow().appearance.material();
         // Decide panel background: if backdrop PNG exists use its baked image (tint already inside),
         // otherwise use fallback gradient with blur (guaranteed not black).
-        let has_backdrop = self.backdrop.is_some();
+        let has_backdrop = self.data.borrow().backdrop.is_some();
         let panel_bg = if has_backdrop {
             material.panel_fill.clone()
         } else {
@@ -773,34 +812,25 @@ impl ViewContent for DockPanelView {
         let sliders_launching = Rc::new(RefCell::new(false));
         let sliders_bounce_count = Rc::new(RefCell::new(0u32));
 
-        /// What a click on a tile does (captured per tile below).
-        #[derive(Clone)]
-        enum TileAction {
-            Launchpad,
-            // Real installed program: click toggles minimize/restore,
-            // launches when not running.
-            Real { item: apps::AppItem },
-            // Demo fallback entry: legacy log/spawn behavior.
-            Demo {
-                name: String,
-                cmd: Option<&'static str>,
-            },
-        }
-        struct TileDef {
-            name: String,
-            fallback_letter: String,
-            item: Option<apps::AppItem>,
-            action: TileAction,
-        }
-        let launchpad_name = tr(&self.lang, "dock.app.launchpad", "Launchpad");
-        let mut tiles: Vec<TileDef> = Vec::with_capacity(self.dock_apps.len() + 1);
+        /// (Re)build all dock tiles from `data` into `state` (wrappers,
+        /// buttons, dots). Runs for the initial row and again on every pin
+        /// change, so the dock updates live without restarting. Callers
+        /// clear `state` vectors and refill `row` afterwards.
+        fn build_row(
+            data: &DockData,
+            state: &Rc<RefCell<DockState>>,
+            sliders_launching: &Rc<RefCell<bool>>,
+            sliders_bounce_count: &Rc<RefCell<u32>>,
+        ) {
+        let launchpad_name = tr(&data.lang, "dock.app.launchpad", "Launchpad");
+        let mut tiles: Vec<TileDef> = Vec::with_capacity(data.dock_apps.len() + 1);
         tiles.push(TileDef {
             name: launchpad_name,
             fallback_letter: String::from("L"),
             item: None,
             action: TileAction::Launchpad,
         });
-        for item in &self.dock_apps {
+        for item in &data.dock_apps {
             let action = match &item.bundle_path {
                 Some(_) => TileAction::Real { item: item.clone() },
                 None => TileAction::Demo {
@@ -830,7 +860,7 @@ impl ViewContent for DockPanelView {
             wrapper.set_halign(gtk::Align::Center);
             wrapper.set_valign(gtk::Align::Center);
             wrapper.set_overflow(gtk::Overflow::Visible);
-            if self.separator_after == Some(index) {
+            if data.separator_after == Some(index) {
                 wrapper.add_css_class("dock-item-sep");
             }
 
@@ -840,7 +870,7 @@ impl ViewContent for DockPanelView {
             tile.set_can_focus(false);
             tile.set_halign(gtk::Align::Center);
             tile.set_valign(gtk::Align::Center);
-            let localized = tr(&self.lang, &format!("dock.app.{}", name.to_lowercase()), name);
+            let localized = tr(&data.lang, &format!("dock.app.{}", name.to_lowercase()), name);
             tile.set_tooltip_text(Some(&localized));
             apply_css(
                 &tile,
@@ -849,7 +879,7 @@ impl ViewContent for DockPanelView {
                 ),
             );
 
-            match self.icons.get(index).and_then(|p| p.as_ref()) {
+            match data.icons.get(index).and_then(|p| p.as_ref()) {
                 Some(path) => {
                     let image = gtk::Image::from_file(path);
                     image.set_pixel_size(ICON_SIZE);
@@ -887,7 +917,7 @@ impl ViewContent for DockPanelView {
             let running = tile_def
                 .item
                 .as_ref()
-                .map(|item| apps::is_running(item, &self.running))
+                .map(|item| apps::is_running(item, &data.running))
                 .unwrap_or(false);
             if !running {
                 dot.add_css_class("dock-dot-hidden");
@@ -910,12 +940,12 @@ impl ViewContent for DockPanelView {
             let state_lp = state.clone();
             let tile_weak = tile.downgrade();
             let wrapper_weak = wrapper.downgrade();
-            let ghost_path = self.icons.get(index).and_then(|p| p.clone());
+            let ghost_path = data.icons.get(index).and_then(|p| p.clone());
             let letter_c = tile_def.fallback_letter.clone();
             let idx_c = index;
             let action_click = tile_def.action.clone();
             let timeout_id_pressed = timeout_id.clone();
-            let lang_lp = self.lang.clone();
+            let lang_lp = data.lang.clone();
             press_gesture.connect_pressed({
                 let state_lp = state_lp.clone();
                 let timeout_id = timeout_id_pressed.clone();
@@ -1167,7 +1197,7 @@ impl ViewContent for DockPanelView {
             let launching_click = sliders_launching.clone();
             let cnt_click = sliders_bounce_count.clone();
             let action_click = action_click.clone();
-            let all_apps_click = self.all_apps.clone();
+            let all_apps_click = data.all_apps.clone();
             let lang_click = lang_lp.clone();
             press_gesture.connect_released(move |gesture, n_press, x, y| {
                 if n_press != 1 {
@@ -1390,6 +1420,14 @@ impl ViewContent for DockPanelView {
             });
             tile.add_controller(press_gesture);
         }
+        }
+
+        build_row(
+            &self.data.borrow(),
+            &state,
+            &sliders_launching,
+            &sliders_bounce_count,
+        );
 
         // Fill row in initial order
         {
@@ -1399,17 +1437,21 @@ impl ViewContent for DockPanelView {
             }
         }
 
+        // Tile keys for the dots refresh, shared so pin rebuilds stay exact.
+        // Tile 0 is the LaunchPad opener and never shows a dot.
+        let tile_keys: Rc<RefCell<Vec<Option<apps::AppItem>>>> = Rc::new(RefCell::new(
+            tile_keys_for(&self.data.borrow().dock_apps),
+        ));
+
         // Running dots follow the open-program list (CoreWindows "list opened
         // programs"): re-query every 2 s and toggle the dot per tile.
-        // Tile 0 is the LaunchPad opener and never shows a dot.
         {
             let state_refresh = state.clone();
-            let mut keys: Vec<Option<apps::AppItem>> = Vec::with_capacity(self.dock_apps.len() + 1);
-            keys.push(None);
-            keys.extend(self.dock_apps.iter().cloned().map(Some));
+            let keys_refresh = tile_keys.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(2000), move || {
                 let snapshot = apps::open_snapshot();
                 let s = state_refresh.borrow();
+                let keys = keys_refresh.borrow();
                 for (dot, key) in s.dots.iter().zip(keys.iter()) {
                     let running = key
                         .as_ref()
@@ -1420,6 +1462,84 @@ impl ViewContent for DockPanelView {
                     } else {
                         dot.add_css_class("dock-dot-hidden");
                     }
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+
+        // Live pins: rebuild the row when pins change (LaunchPad context
+        // menu), without restarting the dock. New pins land far right.
+        {
+            let data_watch = self.data.clone();
+            let state_watch = state.clone();
+            let keys_watch = tile_keys.clone();
+            let sliders_l = sliders_launching.clone();
+            let sliders_n = sliders_bounce_count.clone();
+            let mut last_version = crate::pins::version();
+            glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                let current = crate::pins::version();
+                if current == last_version {
+                    return glib::ControlFlow::Continue;
+                }
+                // Defer while a drag is in flight; the version stays new.
+                if state_watch.borrow().dragging.is_some() {
+                    return glib::ControlFlow::Continue;
+                }
+                last_version = current;
+                // Reload pins + icons + dots.
+                let loaded = apps::load();
+                let appearance = data_watch.borrow().appearance;
+                set_tile_count(loaded.dock.len() + 1);
+                let icons = generate_temp_icons(appearance, &loaded.dock);
+                let running = apps::open_snapshot();
+                let separator_after = if loaded.demo_mode { Some(4) } else { None };
+                {
+                    let mut data = data_watch.borrow_mut();
+                    data.dock_apps = loaded.dock;
+                    data.all_apps = loaded.all;
+                    data.icons = icons;
+                    data.running = running;
+                    data.separator_after = separator_after;
+                }
+                // Clear row + drag artifacts, reset state vectors.
+                {
+                    let mut s = state_watch.borrow_mut();
+                    while let Some(child) = s.row.first_child() {
+                        s.row.remove(&child);
+                    }
+                    if s.placeholder.parent().is_some() {
+                        s.row.remove(&s.placeholder);
+                    }
+                    s.wrappers.clear();
+                    s.buttons.clear();
+                    s.dots.clear();
+                    s.order = (0..data_watch.borrow().dock_apps.len() + 1).collect();
+                    s.dragging = None;
+                    s.suppress_click = false;
+                    s.ghost.set_visible(false);
+                    while let Some(child) = s.ghost.first_child() {
+                        s.ghost.remove(&child);
+                    }
+                    s.placeholder.set_visible(false);
+                    s.placeholder_above.set_visible(false);
+                }
+                // Rebuild tiles + refill + fix shared dots keys.
+                build_row(&data_watch.borrow(), &state_watch, &sliders_l, &sliders_n);
+                *keys_watch.borrow_mut() = tile_keys_for(&data_watch.borrow().dock_apps);
+                {
+                    let s = state_watch.borrow();
+                    for &idx in &s.order {
+                        s.row.append(&s.wrappers[idx]);
+                    }
+                }
+                // Panel size may have changed: re-place + fix input region.
+                if let Some(win) = state_watch
+                    .borrow()
+                    .overlay
+                    .root()
+                    .and_then(|root| root.downcast::<gtk::Window>().ok())
+                {
+                    place_dock(&win);
                 }
                 glib::ControlFlow::Continue
             });
@@ -2195,16 +2315,17 @@ fn main() {
 
     let mut app = App::new("Dock", 320, 240);
     let separator_after = if loaded.demo_mode { Some(4) } else { None };
-    app.set_root(DockRoot(DockPanelView {
-        icons,
+    let data = Rc::new(RefCell::new(DockData {
         dock_apps: loaded.dock,
         all_apps: loaded.all,
+        icons,
         running,
         separator_after,
         appearance,
         backdrop,
         lang,
     }));
+    app.set_root(DockRoot(DockPanelView { data }));
     app.no_window_bar();
     app.no_window_frame();
     app.set_color_scheme(appearance.to_color_scheme());

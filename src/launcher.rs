@@ -25,13 +25,72 @@ const TAPP_SYSTEM: &str = "/usr/bin/tapp";
 /// Launch `bundle_path` (`....app`) as its own process, never in-process.
 /// Returns immediately; success/failure is only logged.
 pub fn launch_app(bundle_path: &Path, display_name: &str) {
+    launch_with_args(bundle_path, display_name, &[]);
+}
+
+/// Launch `bundle_path` with extra passthrough arguments (after `--`).
+/// Prefers the LaunchPad daemon only when no args are given (its
+/// `start_app` takes no arguments); `tapp` receives the args directly.
+pub fn launch_with_args(bundle_path: &Path, display_name: &str, args: &[String]) {
     let path = bundle_path.to_path_buf();
     let name = display_name.to_string();
+    let args = args.to_vec();
     std::thread::spawn(move || {
-        if try_launchpad_daemon(&path, &name) {
+        if args.is_empty() && try_launchpad_daemon(&path, &name) {
             return;
         }
-        spawn_tapp(&path, &name);
+        spawn_tapp(&path, &name, &args);
+    });
+}
+
+/// Reveal `bundle_path` in the file manager: prefer the installed Finder
+/// (`tapp <Finder.app> -- <dir>`), fall back to `xdg-open <dir>`.
+pub fn open_in_finder(bundle_path: &Path) {
+    let dir = bundle_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let dir_str = dir.to_string_lossy().into_owned();
+    std::thread::spawn(move || {
+        let finder = crate::CoreWindows::list_programs().into_iter().find(|app| {
+            app.bundle_id.eq_ignore_ascii_case("com.tontoo.finder")
+                || app.display_name.eq_ignore_ascii_case("Finder")
+        });
+        if let Some(app) = finder {
+            let tapp = find_tapp();
+            let mut command = std::process::Command::new(&tapp);
+            command
+                .arg(&app.bundle_path)
+                .arg("--")
+                .arg(&dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            match command.spawn() {
+                Ok(child) => println!(
+                    "[dock] revealed {} in Finder (pid {})",
+                    dir_str,
+                    child.id()
+                ),
+                Err(err) => eprintln!("[dock] reveal in Finder failed: {err}"),
+            }
+            return;
+        }
+        match std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => println!("[dock] revealed {dir_str} via xdg-open"),
+            Err(err) => eprintln!("[dock] reveal {dir_str} failed: {err}"),
+        }
     });
 }
 
@@ -84,15 +143,18 @@ fn try_launchpad_daemon(_bundle_path: &Path, _display_name: &str) -> bool {
     false
 }
 
-/// Spawn `tapp <bundle>` detached: stdio nulled, own process group on
-/// Linux, never waited on by the dock.
-fn spawn_tapp(bundle_path: &Path, display_name: &str) {
+/// Spawn `tapp <bundle> [-- args...]` detached: stdio nulled, own process
+/// group on Linux, never waited on by the dock.
+fn spawn_tapp(bundle_path: &Path, display_name: &str, args: &[String]) {
     use std::process::Stdio;
 
     let tapp = find_tapp();
     let mut command = std::process::Command::new(&tapp);
+    command.arg(bundle_path);
+    if !args.is_empty() {
+        command.arg("--").args(args);
+    }
     command
-        .arg(bundle_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
