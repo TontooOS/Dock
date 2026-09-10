@@ -146,8 +146,8 @@ dot.set_margin_top(4);
 fallback without a daemon uses the legacy heuristic. CSS:
 
 ```css
-.dock-dot { background: rgba(30,30,30,0.72); /* light */ }
-.dock-dot { background: rgba(255,255,255,0.92); /* dark */ }
+.dock-dot { background: rgba(0,0,0,0.85); /* light: black dot */ }
+.dock-dot { background: rgba(255,255,255,0.92); /* dark: white dot */ }
 ```
 
 Non-running dots get `dock-dot-hidden` (`opacity:0`) so layout stays stable.
@@ -257,9 +257,12 @@ main loop is never blocked):
    plain `tapp` from `PATH` elsewhere) is spawned detached with nulled
    stdio and its own process group on Linux. The dock never waits on it.
 
-Dock tiles bounce first, then launch. LaunchPad tiles launch and close the
-grid macOS-style. Demo entries without a bundle only log (Sliders keeps its
-legacy `vlc` launch loop).
+Dock tiles bounce first, then toggle: a fresh open-window snapshot
+decides per click — visible windows of the app minimize
+(`WindowsProvider::minimize_window`), fully minimized apps restore
+(`WindowsProvider::restore_window`), closed apps launch out-of-process.
+LaunchPad tiles launch and close the grid macOS-style. Demo entries
+without a bundle only log (Sliders keeps its legacy `vlc` launch loop).
 
 ## Launchpad
 

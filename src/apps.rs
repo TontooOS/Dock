@@ -10,7 +10,6 @@
 //! `/Applications`), a hardcoded demo set is used so the dock still
 //! renders and stays interactive.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::CoreIcon::{
@@ -217,64 +216,101 @@ pub fn fallback_style(name: &str) -> (&'static str, SFSymbol) {
     }
 }
 
-/// Snapshot of the currently open programs (bundle ids + app names,
-/// lowercased) for the running dots.
+/// One open window relevant for dots and click toggling.
+#[derive(Clone, Debug)]
+pub struct OpenWindow {
+  /// Daemon-side window id (for minimize/restore actions).
+  pub id: u64,
+  /// Whether the window is currently minimized to the dock.
+  pub minimized: bool,
+  /// Bundle id from the owning `.app` `Info.tontoo`, if any.
+  pub bundle_id: Option<String>,
+  /// Display name (localized bundle name, title or app id).
+  pub app_name: Option<String>,
+}
+
+/// Snapshot of the currently open programs for dots and click toggling.
 pub struct OpenSnapshot {
-    /// `false` when the window daemon is unreachable; dots then fall back
-    /// to the legacy demo heuristic (see [`is_running`]).
-    pub daemon_ok: bool,
-    /// Lowercased bundle ids and app names of all open windows.
-    pub ids: HashSet<String>,
+  /// `false` when the window daemon is unreachable; dots then fall back
+  /// to the legacy demo heuristic (see [`is_running`]) and clicks fall
+  /// back to launching.
+  pub daemon_ok: bool,
+  /// All open windows (visible and minimized).
+  pub windows: Vec<OpenWindow>,
 }
 
 /// Currently open programs via CoreWindows (`WindowsProvider::windows`).
 /// Never fails: an unreachable daemon yields an empty snapshot with
 /// `daemon_ok == false`.
 pub fn open_snapshot() -> OpenSnapshot {
-    match crate::CoreWindows::WindowsProvider::from_env().windows() {
-        Ok(windows) => {
-            let mut ids = HashSet::new();
-            for w in &windows {
-                if let Some(bundle) = w.bundle_id.as_deref() {
-                    ids.insert(bundle.to_lowercase());
-                }
-                if let Some(name) = w.app_name.as_deref() {
-                    ids.insert(name.to_lowercase());
-                }
-            }
-            OpenSnapshot {
-                daemon_ok: true,
-                ids,
-            }
-        }
-        Err(err) => {
-            if std::env::var("DOCK_DEBUG").is_ok() {
-                eprintln!("[dock] open windows unavailable: {err}");
-            }
-            OpenSnapshot {
-                daemon_ok: false,
-                ids: HashSet::new(),
-            }
-        }
+  match crate::CoreWindows::WindowsProvider::from_env().windows() {
+    Ok(windows) => {
+      let windows = windows
+        .into_iter()
+        .map(|w| OpenWindow {
+          id: w.id,
+          minimized: w.minimized,
+          bundle_id: w.bundle_id,
+          app_name: w.app_name,
+        })
+        .collect();
+      OpenSnapshot {
+        daemon_ok: true,
+        windows,
+      }
     }
+    Err(err) => {
+      if std::env::var("DOCK_DEBUG").is_ok() {
+        eprintln!("[dock] open windows unavailable: {err}");
+      }
+      OpenSnapshot {
+        daemon_ok: false,
+        windows: Vec::new(),
+      }
+    }
+  }
 }
 
-/// Whether `item` currently runs and deserves a dot.
+fn window_matches(item: &AppItem, window: &OpenWindow) -> bool {
+  window
+    .bundle_id
+    .as_deref()
+    .map(|bundle| bundle.eq_ignore_ascii_case(&item.bundle_id))
+    .unwrap_or(false)
+    || window
+      .app_name
+      .as_deref()
+      .map(|name| name.eq_ignore_ascii_case(&item.display_name))
+      .unwrap_or(false)
+}
+
+/// Whether `item` currently runs and deserves a dot (visible or
+/// minimized windows count).
 ///
 /// With a reachable daemon this is exact (bundle id or app name matches an
 /// open window). Without a daemon only demo entries show dots, using the
 /// legacy heuristic (Finder/Mail always, Sliders while its process runs).
 pub fn is_running(item: &AppItem, snapshot: &OpenSnapshot) -> bool {
-    if snapshot.daemon_ok {
-        return snapshot.ids.contains(&item.bundle_id.to_lowercase())
-            || snapshot.ids.contains(&item.display_name.to_lowercase());
-    }
-    if item.bundle_path.is_some() {
-        return false;
-    }
-    match item.display_name.as_str() {
-        "Finder" | "Mail" => true,
-        "Sliders" => crate::x11_place::is_app_running(),
-        _ => false,
-    }
+  if snapshot.daemon_ok {
+    return snapshot.windows.iter().any(|w| window_matches(item, w));
+  }
+  if item.bundle_path.is_some() {
+    return false;
+  }
+  match item.display_name.as_str() {
+    "Finder" | "Mail" => true,
+    "Sliders" => crate::x11_place::is_app_running(),
+    _ => false,
+  }
+}
+
+/// Open windows of `item` as `(daemon id, minimized)` pairs.
+/// Empty when the app is not running.
+pub fn app_windows(item: &AppItem, snapshot: &OpenSnapshot) -> Vec<(u64, bool)> {
+  snapshot
+    .windows
+    .iter()
+    .filter(|w| window_matches(item, w))
+    .map(|w| (w.id, w.minimized))
+    .collect()
 }

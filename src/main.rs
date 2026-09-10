@@ -80,8 +80,8 @@ impl Appearance {
                 inset_highlight: rgba((255, 255, 255), 0.06),
                 drop_shadow: String::from("0 16px 48px rgba(0,0,0,0.22), 0 4px 16px rgba(0,0,0,0.14), inset 0 1px 0 rgba(255,255,255,0.06)"),
                 tile_shadow: rgba((0, 0, 0), 0.12),
-                dot_color: rgba((255, 255, 255), 0.95),
-                dot_glow: rgba((255, 255, 255), 0.28),
+                dot_color: rgba((0, 0, 0), 0.85),
+                dot_glow: rgba((0, 0, 0), 0.25),
                 separator: rgba((255, 255, 255), 0.08),
                 bg_fallback_top: String::from("rgba(55,55,58,0.30)"),
                 bg_fallback_bottom: String::from("rgba(28,28,30,0.24)"),
@@ -474,6 +474,50 @@ fn generate_temp_icons(appearance: Appearance, dock_apps: &[apps::AppItem]) -> V
     icons
 }
 
+// ── Click toggling (minimize / restore / launch) ───────────────────────
+// Single click on a running app minimizes all its visible windows;
+// clicking again restores all minimized ones (macOS behavior). Closed
+// apps launch out-of-process via the launcher.
+fn toggle_app_windows(item: &apps::AppItem) {
+    let snapshot = apps::open_snapshot();
+    if !snapshot.daemon_ok {
+        // No daemon: fall back to launching.
+        return launch_item(item);
+    }
+    let windows = apps::app_windows(item, &snapshot);
+    if windows.is_empty() {
+        return launch_item(item);
+    }
+    let provider = crate::CoreWindows::WindowsProvider::from_env();
+    let visible: Vec<u64> = windows
+        .iter()
+        .filter(|(_, minimized)| !minimized)
+        .map(|(id, _)| *id)
+        .collect();
+    if !visible.is_empty() {
+        for id in visible {
+            match provider.minimize_window(id) {
+                Ok(()) => println!("[dock] minimized {} (window {id})", item.display_name),
+                Err(err) => eprintln!("[dock] minimize window {id} failed: {err}"),
+            }
+        }
+        return;
+    }
+    for (id, _) in &windows {
+        match provider.restore_window(*id) {
+            Ok(()) => println!("[dock] restored {} (window {id})", item.display_name),
+            Err(err) => eprintln!("[dock] restore window {id} failed: {err}"),
+        }
+    }
+}
+
+fn launch_item(item: &apps::AppItem) {
+    match item.bundle_path.as_deref() {
+        Some(bundle_path) => launcher::launch_app(bundle_path, &item.display_name),
+        None => println!("[dock] launch request: {}", item.display_name),
+    }
+}
+
 // ── Dock panel view ────────────────────────────────────────────────────
 struct DockPanelView {
     /// Tile icons aligned with the tiles: `[launchpad, app0, app1, ...]`.
@@ -733,11 +777,9 @@ impl ViewContent for DockPanelView {
         #[derive(Clone)]
         enum TileAction {
             Launchpad,
-            // Real installed program: launched out-of-process.
-            Real {
-                bundle_path: std::path::PathBuf,
-                name: String,
-            },
+            // Real installed program: click toggles minimize/restore,
+            // launches when not running.
+            Real { item: apps::AppItem },
             // Demo fallback entry: legacy log/spawn behavior.
             Demo {
                 name: String,
@@ -759,14 +801,11 @@ impl ViewContent for DockPanelView {
             action: TileAction::Launchpad,
         });
         for item in &self.dock_apps {
-            let action = match (&item.bundle_path, item.demo_cmd) {
-                (Some(bundle_path), _) => TileAction::Real {
-                    bundle_path: bundle_path.clone(),
+            let action = match &item.bundle_path {
+                Some(_) => TileAction::Real { item: item.clone() },
+                None => TileAction::Demo {
                     name: item.display_name.clone(),
-                },
-                (None, cmd) => TileAction::Demo {
-                    name: item.display_name.clone(),
-                    cmd,
+                    cmd: item.demo_cmd,
                 },
             };
             tiles.push(TileDef {
@@ -1256,15 +1295,12 @@ impl ViewContent for DockPanelView {
                     };
                     match &action_click {
                         TileAction::Launchpad => unreachable!(),
-                        TileAction::Real {
-                            bundle_path,
-                            name,
-                        } => {
-                            // Real installed program: bounce, then hand off to
-                            // the out-of-process launcher (LaunchPad daemon
-                            // temp process, fallback detached tapp).
+                        TileAction::Real { item } => {
+                            // Real installed program: bounce, then toggle.
+                            // Visible windows minimize, minimized ones
+                            // restore, closed apps launch out-of-process.
                             do_bounce(&tile_click);
-                            launcher::launch_app(bundle_path, name);
+                            toggle_app_windows(item);
                         }
                         TileAction::Demo { name, cmd } => {
                             // Demo fallback entries keep the legacy behavior.
