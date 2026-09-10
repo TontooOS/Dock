@@ -3,6 +3,7 @@
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::UIKit::app::ColorScheme;
 
 use crate::CoreIcon::generator::*;
@@ -10,6 +11,16 @@ use crate::CoreIcon::octopus::OctopusVariant;
 use crate::CoreIcon::{Color as IconColor, Gradient, GradientDirection, GradientStop, SFSymbol};
 
 use crate::apps::{fallback_style, AppItem};
+
+/// Open context menus (right-click). While any is open the LaunchPad
+/// auto-close paths (active/focus loss, ESC) stay quiet so the menu — not
+/// the window — handles dismissal.
+static MENU_OPEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a tile context menu is currently open.
+fn menu_open() -> bool {
+    MENU_OPEN.load(Ordering::Relaxed) > 0
+}
 
 const ICON_CORNER_RADIUS: f32 = 250.0;
 /// Cache version of the legacy demo tiles (`tontoo-launchpad-<name>-v2.png`).
@@ -336,6 +347,161 @@ fn show_app_menu(parent: &gtk::Button, item: &AppItem, win: &gtk::Window, x: f64
 
     popover.set_child(Some(&vbox));
     popover.popup();
+    // Suppress LaunchPad auto-close while the menu is up; the menu (or an
+    // outside click) dismisses instead. The counted flag keeps destroy and
+    // closed from double-counting.
+    MENU_OPEN.fetch_add(1, Ordering::Relaxed);
+    let counted = Rc::new(RefCell::new(true));
+    let counted_closed = counted.clone();
+    popover.connect_closed(move |_| {
+        if *counted_closed.borrow() {
+            *counted_closed.borrow_mut() = false;
+            MENU_OPEN.fetch_sub(1, Ordering::Relaxed);
+        }
+    });
+    popover.connect_destroy(move |_| {
+        if *counted.borrow() {
+            *counted.borrow_mut() = false;
+            MENU_OPEN.fetch_sub(1, Ordering::Relaxed);
+        }
+    });
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    fn test_item() -> AppItem {
+        let (color, symbol) = crate::apps::fallback_style("TestApp");
+        AppItem {
+            display_name: "TestApp".to_string(),
+            bundle_id: "com.test.app".to_string(),
+            bundle_path: Some(std::path::PathBuf::from("/Applications/TestApp.app")),
+            icon_path: None,
+            color,
+            symbol,
+            demo_cmd: None,
+        }
+    }
+
+    fn pump() {
+        let ctx = glib::MainContext::default();
+        for _ in 0..200 {
+            if !ctx.iteration(false) {
+                break;
+            }
+        }
+    }
+
+    fn find_popover(btn: &gtk::Button) -> Option<gtk::Popover> {
+        let mut child = btn.first_child();
+        while let Some(c) = child {
+            if let Ok(pop) = c.clone().downcast::<gtk::Popover>() {
+                return Some(pop);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    fn find_tile_button(root: &gtk::Widget) -> Option<gtk::Button> {
+        use gtk::prelude::*;
+        if let Ok(btn) = root.clone().downcast::<gtk::Button>() {
+            if btn.has_css_class("app-tile") {
+                return Some(btn);
+            }
+        }
+        let mut child = root.first_child();
+        while let Some(c) = child {
+            if let Some(found) = find_tile_button(&c) {
+                return Some(found);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    fn find_launchpad_window() -> Option<gtk::Window> {
+        use gtk::prelude::*;
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("LaunchPad"))
+    }
+
+    #[test]
+    fn context_menu_stays_visible() {
+        gtk::init().expect("gtk init needs a display (DISPLAY=:0)");
+        let win = gtk::Window::new();
+        let btn = gtk::Button::new();
+        win.set_child(Some(&btn));
+        win.present();
+        // Wait until the toplevel is really mapped.
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            pump();
+            if win.is_mapped() {
+                break;
+            }
+        }
+        assert!(win.is_mapped(), "test window never mapped");
+
+        show_app_menu(&btn, &test_item(), &win, 10.0, 10.0);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        pump();
+
+        let popover = find_popover(&btn).expect("popover parented to tile button");
+        assert!(
+            popover.get_visible(),
+            "popover not shown after popup()"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        pump();
+        assert!(popover.is_visible(), "menu dismissed immediately after popup");
+        // Open + separator + Open In Finder + Pin to Dock = 4 rows.
+        let vbox = popover
+            .child()
+            .and_then(|c| c.downcast::<gtk::Box>().ok())
+            .expect("menu content box");
+        assert_eq!(vbox.observe_children().n_items(), 4);
+        win.close();
+        pump();
+    }
+
+    /// Full scenario within the same test (same thread: GTK is neither
+    /// thread-safe nor re-initializable): real LaunchPad window (with
+    /// auto-close handlers) + the exact right-click path. The window must
+    /// stay open with a visible menu instead of closing.
+    fn right_click_scenario() {
+        let item = test_item();
+        show_launchpad(vec![item.clone()]);
+        // Wait for the mapped LaunchPad window.
+        let mut win_opt = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            pump();
+            if let Some(w) = find_launchpad_window() {
+                if w.is_mapped() {
+                    win_opt = Some(w);
+                    break;
+                }
+            }
+        }
+        let win = win_opt.expect("launchpad window never mapped");
+        let tile = find_tile_button(win.upcast_ref()).expect("no app tile found");
+        // Exactly what the right-click handler does.
+        show_app_menu(&tile, &item, &win, 10.0, 10.0);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        pump();
+        assert!(win.is_mapped(), "launchpad closed on right-click");
+        let popover = find_popover(&tile).expect("popover parented to tile button");
+        assert!(popover.is_visible(), "menu not visible after right-click");
+        win.close();
+        pump();
+        // Part 2 (same thread): full LaunchPad scenario with auto-close
+        // handlers must keep the window open with a visible menu.
+        right_click_scenario();
+    }
 }
 
 /// Open the LaunchPad grid for `items` (all installed programs).
@@ -678,6 +844,10 @@ pub fn show_launchpad(items: Vec<AppItem>) {
         if w.is_active() {
             *has_been_active_c.borrow_mut() = true;
         } else if *has_been_active_is.borrow() {
+            // A context menu keeps keyboard focus: never close for it.
+            if menu_open() {
+                return;
+            }
             w.close();
         }
     });
@@ -694,6 +864,10 @@ pub fn show_launchpad(items: Vec<AppItem>) {
         let w = win_focus.clone();
         let has_active = has_been_active_focus.clone();
         glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+            // A context menu steals keyboard focus first: never close for it.
+            if menu_open() {
+                return;
+            }
             if *has_active.borrow() && !w.is_active() {
                 w.close();
             }
@@ -779,11 +953,14 @@ pub fn show_launchpad(items: Vec<AppItem>) {
         });
     }
 
-    // ESC to close
+    // ESC to close (the context menu handles its own ESC first).
     let key = gtk::EventControllerKey::new();
     let win_c = win.clone();
     key.connect_key_pressed(move |_, keyval, _, _| {
         if keyval == gtk::gdk::Key::Escape {
+            if menu_open() {
+                return glib::Propagation::Stop;
+            }
             win_c.close();
             return glib::Propagation::Stop;
         }

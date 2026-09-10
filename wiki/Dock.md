@@ -291,6 +291,9 @@ Right-clicking a tile opens a popover menu: Open (launches and closes
 the grid), a divider, Open In Finder (reveals the bundle), and Pin to
 Dock — or Remove from Dock when already pinned (real programs only).
 Pin changes save to CoreData and appear live in the dock (see Pins).
+While a menu is open (`MENU_OPEN`) the LaunchPad auto-close paths
+(active/focus loss, ESC) stay quiet so the menu — not the window —
+handles dismissal; an outside click still closes everything.
 
 ### Async Icon Loading
 
