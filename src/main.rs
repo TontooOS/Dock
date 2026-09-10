@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 sdk::preinclude!();
 use UIKit::prelude::*;
 use UIKit::widget::apply_css;
-use UIKitDynamics::{Spring, SpringPreset};
 use CoreIcon::generator::*;
 use CoreIcon::{
     Color as IconColor, Gradient, GradientDirection, GradientStop, SFSymbol,
@@ -1248,7 +1247,7 @@ impl ViewContent for DockPanelView {
                         }
                     }
                     if matches!(action_click, TileAction::Launchpad) {
-                        launchpad::show_launchpad(all_apps_click);
+                        launchpad::show_launchpad(all_apps_click.clone());
                         return;
                     }
                     // Bounce on click for every app (2-3 bounces)

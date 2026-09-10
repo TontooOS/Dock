@@ -94,7 +94,7 @@ pub fn load_all() -> Vec<AppItem> {
         .collect()
 }
 
-fn from_entry(entry: &crate::CoreWindows::AppEntry) -> AppItem {
+fn from_entry(entry: crate::CoreWindows::AppEntry) -> AppItem {
     let (color, symbol) = fallback_style(&entry.display_name);
     AppItem {
         display_name: entry.display_name.clone(),
