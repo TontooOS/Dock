@@ -1,0 +1,6 @@
+{
+  "bundle_id": "com.tontoo.dock",
+  "name": "Dock",
+  "version": "26.1.0",
+  "icon": "Resources/launchpad.png"
+}
