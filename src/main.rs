@@ -1776,6 +1776,16 @@ pub mod x11_place {
     }
 
     pub fn xid_of(surface: &gtk::gdk::Surface) -> Option<u32> {
+        use gtk::prelude::*;
+        // Only X11 surfaces have an XID. On the Wayland backend
+        // gdk_x11_surface_get_xid would return garbage, so report None
+        // and let callers skip the move (compositor default spot).
+        let backend_is_x11 = gtk::gdk::Display::default()
+            .map(|d| d.type_().name().to_string().contains("X11"))
+            .unwrap_or(false);
+        if !backend_is_x11 {
+            return None;
+        }
         extern "C" {
             fn gdk_x11_surface_get_xid(surface: *const std::ffi::c_void) -> u32;
         }

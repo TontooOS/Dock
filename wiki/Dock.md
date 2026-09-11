@@ -348,7 +348,12 @@ The dock ships as a TBuild system app (`tontoo.proj`, `bundle_id`
   Wayland socket (plus the XWayland socket for `XMoveWindow`
   self-positioning) and then execs `/usr/bin/tapp
   /System/Applications/Dock.app`. It depends on `compositor` and
-  `live-setup` and restarts on crash.
+  `live-setup` and restarts on crash. The starter pins
+  `GDK_BACKEND=x11`: the dock has no layer-shell code and positions
+  itself exclusively via X11 moves. Under the Wayland backend
+  `x11_place::xid_of` returns `None`, every move is skipped and the
+  dock/LaunchPad land at the compositor default spot; `GDK_BACKEND`
+  must never be forced to `wayland` for this app.
 - Language files are staged at `/usr/share/tontoo/dock/lang/`
   (`en_us.json`, `de_de.json`, same lookup as `Menubar.app`).
 - The compositor renders nothing at the bottom itself; minimized
