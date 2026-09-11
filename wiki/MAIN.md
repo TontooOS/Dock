@@ -31,3 +31,11 @@ clicks bounce 2–3 times, and the vertical separator divides apps from system
 items.
 
 See [Dock.md](Dock.md) for details.
+
+## Changelog
+
+- 2026-09-10: Added `tontoo.proj` (`com.tontoo.dock`, name `Dock`) so
+  the dock builds as a TBuild system app (`Dock.app`). The compositor no
+  longer renders its own dock; the ISO stages this app at
+  `/System/Applications/Dock.app` and starts it via the `dock`
+  LaunchPad service. See [Dock.md](Dock.md).

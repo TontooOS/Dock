@@ -324,6 +324,36 @@ warm. Cache hits skip generation entirely. Main thread only:
 `CoreIcon::generator::ASSETS_DIR` is `static mut`, so a background thread
 would data-race and abort GTK randomly.
 
+## System Integration
+
+The dock ships as a TBuild system app (`tontoo.proj`, `bundle_id`
+`com.tontoo.dock`, name `Dock`):
+
+```json
+{
+  "bundle_id": "com.tontoo.dock",
+  "name": "Dock",
+  "version": "26.1.0",
+  "icon": "Resources/launchpad.png"
+}
+```
+
+- The ISO build compiles it with TBuild and stages the extracted bundle
+  at `/System/Applications/Dock.app` (see
+  `BaseOS/scripts/stage-dock.sh`, run from `BaseOS/scripts/build-iso.sh`
+  right after the `menubar` stage).
+- At boot the `dock` LaunchPad service
+  (`System/services/dock.service`, type `sys`) starts it via
+  `/usr/local/bin/start-dock.sh`, which waits for the compositor
+  Wayland socket (plus the XWayland socket for `XMoveWindow`
+  self-positioning) and then execs `/usr/bin/tapp
+  /System/Applications/Dock.app`. It depends on `compositor` and
+  `live-setup` and restarts on crash.
+- Language files are staged at `/usr/share/tontoo/dock/lang/`
+  (`en_us.json`, `de_de.json`, same lookup as `Menubar.app`).
+- The compositor renders nothing at the bottom itself; minimized
+  windows are restored through the `restore_window` windows-ipc op.
+
 ## Building and Testing
 
 ```bash
