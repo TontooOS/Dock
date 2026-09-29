@@ -7,7 +7,7 @@ bottom-center with click-through outside. Hover magnification is disabled.
 
 - Repository: tontoo-os/TontooProgramms/Dock
 - License: TCL v26.1
-- Version: 26.1.0
+- Version: 27.0.0
 
 ## Feature Index
 

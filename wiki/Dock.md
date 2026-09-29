@@ -333,7 +333,7 @@ The dock ships as a TBuild system app (`tontoo.proj`, `bundle_id`
 {
   "bundle_id": "com.tontoo.dock",
   "name": "Dock",
-  "version": "26.1.0",
+  "version": "27.0.0",
   "icon": "Resources/launchpad.png"
 }
 ```

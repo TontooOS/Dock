@@ -213,9 +213,9 @@ fn generate_tontoo_icon_cached(is_light: bool) -> Option<String> {
         }
     }
     let os_candidates = [
-        format!("{}/../../TontooLibs/CoreIcon/assets/TontooOS/OSVersionAssets/26.1.0/TontooOS_Icon.png", env!("CARGO_MANIFEST_DIR")),
-        "/mnt/c/Users/arlo1/Documents/TontooLibs/CoreIcon/assets/TontooOS/OSVersionAssets/26.1.0/TontooOS_Icon.png".to_string(),
-        "C:/Users/arlo1/Documents/TontooLibs/CoreIcon/assets/TontooOS/OSVersionAssets/26.1.0/TontooOS_Icon.png".to_string(),
+        format!("{}/../../TontooLibs/CoreIcon/assets/TontooOS/OSVersionAssets/27.0.0/TontooOS_Icon.png", env!("CARGO_MANIFEST_DIR")),
+        "/mnt/c/Users/arlo1/Documents/TontooLibs/CoreIcon/assets/TontooOS/OSVersionAssets/27.0.0/TontooOS_Icon.png".to_string(),
+        "C:/Users/arlo1/Documents/TontooLibs/CoreIcon/assets/TontooOS/OSVersionAssets/27.0.0/TontooOS_Icon.png".to_string(),
     ];
     for p in os_candidates {
         if let Ok(img) = image::open(&p) {
@@ -225,7 +225,7 @@ fn generate_tontoo_icon_cached(is_light: bool) -> Option<String> {
             }
         }
     }
-    if let Ok(img) = crate::CoreIcon::os_version::use_osversionicons("26.1.0", "TontooOS_Icon.png") {
+    if let Ok(img) = crate::CoreIcon::os_version::use_osversionicons("27.0.0", "TontooOS_Icon.png") {
         let thumb = image::imageops::resize(&img, 64, 64, image::imageops::FilterType::Lanczos3);
         if thumb.save(&out).is_ok() {
             return Some(out);
