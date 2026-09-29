@@ -6,7 +6,7 @@ TontooUIKit, TontooUI, CoreIcon and GTK4. It has no traffic lights and floats
 bottom-center with click-through outside. Hover magnification is disabled.
 
 - Repository: tontoo-os/TontooProgramms/Dock
-- License: TCL v26.1
+- License: TCL v27.0
 - Version: 27.0.0
 
 ## Feature Index
