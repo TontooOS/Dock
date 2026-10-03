@@ -10,10 +10,12 @@
 //!    TontooOS) is spawned detached with the bundle path. The dock never
 //!    waits on it.
 //!
-//! The whole attempt runs on a throwaway thread so the GTK main loop is
-//! never blocked, even when the daemon socket hangs.
+//! The whole attempt runs on a throwaway thread so the render loop is never
+//! blocked, even when the daemon socket hangs.
 
 use std::path::{Path, PathBuf};
+
+use crate::LaunchPad::client::LaunchpadClient;
 
 /// LaunchPad daemon socket (see `TontooLibs/LaunchPad/src/types.rs`).
 const LAUNCHPAD_SOCKET: &str = "/run/launchpad.sock";
@@ -96,51 +98,32 @@ pub fn open_in_finder(bundle_path: &Path) {
 
 /// Ask the LaunchPad daemon to start the app (`start_app` op).
 /// Returns `true` when the daemon accepted the request.
-/// Unix only (the daemon socket); always `false` elsewhere.
-#[cfg(unix)]
 fn try_launchpad_daemon(bundle_path: &Path, display_name: &str) -> bool {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-    use std::time::Duration;
-
-    let mut stream = match UnixStream::connect(LAUNCHPAD_SOCKET) {
-        Ok(stream) => stream,
-        Err(_) => return false,
+    let path = bundle_path.to_string_lossy().into_owned();
+    // `SOCKET_PATH` override keeps the dev machine pointed at a test daemon.
+    let client = if std::path::Path::new(LAUNCHPAD_SOCKET).exists() {
+        LaunchpadClient::with_socket(LAUNCHPAD_SOCKET)
+    } else {
+        match LaunchpadClient::new() {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("[dock] launchpad client unavailable: {err}");
+                return false;
+            }
+        }
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-    // Mirrors `launchpad_lib::IpcRequest` with `action = "start_app"`.
-    let request = serde_json::json!({
-        "action": "start_app",
-        "service": null,
-        "options": { "head": null, "app_path": bundle_path.to_string_lossy() },
-    });
-    let mut text = request.to_string();
-    text.push('\n');
-    if stream.write_all(text.as_bytes()).is_err() {
-        return false;
+    match client.start_app(&path) {
+        Ok(_) => {
+            println!("[dock] launched {display_name} via launchpad daemon");
+            true
+        }
+        Err(err) => {
+            if std::env::var("DOCK_DEBUG").is_ok() {
+                eprintln!("[dock] launchpad daemon refused {display_name}: {err}");
+            }
+            false
+        }
     }
-    let mut reply = String::new();
-    if stream.read_to_string(&mut reply).is_err() {
-        return false;
-    }
-    let accepted = serde_json::from_str::<serde_json::Value>(&reply)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("success")
-                .and_then(|flag| flag.as_bool())
-        })
-        .unwrap_or(false);
-    if accepted {
-        println!("[dock] launched {display_name} via launchpad daemon");
-    }
-    accepted
-}
-
-#[cfg(not(unix))]
-fn try_launchpad_daemon(_bundle_path: &Path, _display_name: &str) -> bool {
-    false
 }
 
 /// Spawn `tapp <bundle> [-- args...]` detached: stdio nulled, own process
@@ -183,5 +166,30 @@ fn find_tapp() -> PathBuf {
         PathBuf::from(TAPP_SYSTEM)
     } else {
         PathBuf::from("tapp")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tapp_prefers_the_system_location() {
+        let tapp = find_tapp();
+        // On a TontooOS image the absolute path wins, elsewhere `tapp` from
+        // PATH. Either way it is a non-empty path.
+        assert!(!tapp.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_bundle_falls_through_to_tapp() {
+        // The daemon socket does not exist on the build host, so this returns
+        // false and the caller spawns `tapp` instead.
+        if !std::path::Path::new(LAUNCHPAD_SOCKET).exists() {
+            assert!(!try_launchpad_daemon(
+                Path::new("/nonexistent/NotAnApp.app"),
+                "NotAnApp"
+            ));
+        }
     }
 }

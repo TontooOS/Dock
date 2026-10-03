@@ -1,13 +1,16 @@
 {
-  "dock.app.launchpad": "Launchpad",
-  "dock.app.sliders": "Sliders",
-  "dock.app.finder": "Finder",
-  "dock.app.mail": "Mail",
-  "dock.app.music": "Music",
-  "dock.app.photos": "Photos",
-  "dock.app.settings": "Settings",
-  "dock.tooltip.launchpad": "Launchpad – Show all apps",
-  "dock.tooltip.running": "{name} – Running",
-  "dock.magnification": "Magnification",
-  "dock.separator.apps_trash": "Apps | Trash"
+  "lang": "en_us",
+  "translations": {
+    "dock.app.launchpad": "Launchpad",
+    "dock.app.sliders": "Sliders",
+    "dock.app.finder": "Finder",
+    "dock.app.mail": "Mail",
+    "dock.app.music": "Music",
+    "dock.app.photos": "Photos",
+    "dock.app.settings": "Settings",
+    "dock.tooltip.launchpad": "Launchpad – Show all apps",
+    "dock.tooltip.running": "%name% – Running",
+    "dock.magnification": "Magnification",
+    "dock.separator.apps_trash": "Apps | Trash"
+  }
 }

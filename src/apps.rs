@@ -311,7 +311,7 @@ pub fn is_running(item: &AppItem, snapshot: &OpenSnapshot) -> bool {
   }
   match item.display_name.as_str() {
     "Finder" | "Mail" => true,
-    "Sliders" => crate::x11_place::is_app_running(),
+    "Sliders" => crate::process::is_running("vlc") || crate::process::is_running("sliders"),
     _ => false,
   }
 }

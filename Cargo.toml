@@ -11,10 +11,10 @@ name = "dock"
 path = "src/main.rs"
 
 [dependencies]
-sdk = { path = "/Library/System/sdk", features = ["UIKit", "CoreIcon", "UIKitDynamics", "TontooUI", "CoreWindows", "CoreData"] }
-gtk = { package = "gtk4", version = "0.9" }
-glib = "0.20"
+# TontooOS SDK: TontooUI (layer-shell surfaces, elements, theme),
+# CoreIcon (generated tile artwork), CoreWindows (app list, open windows,
+# minimize/restore), CoreData (dock pins), Accessibility (lang),
+# LaunchPad (out-of-process app start).
+sdk = { path = "/Library/System/sdk", features = ["TontooUI", "CoreIcon", "CoreWindows", "CoreData", "Accessibility", "LaunchPad"] }
+# Raster work for the generated tile cache and the baked panel backdrop.
 image = "0.25"
-x11rb = { version = "0.13", features = ["randr", "shape"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"

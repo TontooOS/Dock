@@ -27,10 +27,10 @@ const BLUR_MARGIN: i32 = 60;
 /// Recipe color grading per appearance: (saturation, brightness add in
 /// 0..1 units). dockLight: saturation 1.8, brightness 0.08.
 /// dockDark: saturation 1.6, no brightness lift (the dark tint darkens).
-pub fn grading(appearance: crate::Appearance) -> (f32, f32) {
+pub fn grading(appearance: crate::theme::Appearance) -> (f32, f32) {
     match appearance {
-        crate::Appearance::Light => (1.8, 0.08),
-        crate::Appearance::Dark => (1.6, 0.0),
+        crate::theme::Appearance::Light => (1.8, 0.08),
+        crate::theme::Appearance::Dark => (1.6, 0.0),
     }
 }
 
@@ -113,16 +113,16 @@ pub fn generate_fallback(
     panel_w: i32,
     panel_h: i32,
     corner_radius: i32,
-    appearance: crate::Appearance,
+    appearance: crate::theme::Appearance,
     out_path: &str,
 ) -> Option<String> {
     // Appearance-matched gradient stops (opaque, will be blurred)
     let (top, bottom) = match appearance {
-        crate::Appearance::Light => (
+        crate::theme::Appearance::Light => (
             Rgba([58u8, 58u8, 61u8, 255u8]),
             Rgba([30u8, 30u8, 33u8, 255u8]),
         ),
-        crate::Appearance::Dark => (
+        crate::theme::Appearance::Dark => (
             Rgba([42u8, 42u8, 44u8, 255u8]),
             Rgba([22u8, 22u8, 24u8, 255u8]),
         ),
@@ -136,8 +136,8 @@ pub fn generate_fallback(
         let b = (top[2] as f32 * (1.0 - t) + bottom[2] as f32 * t) as u8;
         // add subtle noise-like variation for depth
         let bright_adjust = match appearance {
-            crate::Appearance::Light => (t * 6.0) as u8,
-            crate::Appearance::Dark => 0,
+            crate::theme::Appearance::Light => (t * 6.0) as u8,
+            crate::theme::Appearance::Dark => 0,
         };
         for x in 0..panel_w {
             let mut px = Rgba([r, g, b, 255]);
@@ -178,7 +178,7 @@ pub fn generate(
     panel_h: i32,
     corner_radius: i32,
     bottom_gap: i32,
-    appearance: crate::Appearance,
+    appearance: crate::theme::Appearance,
     out_path: &str,
 ) -> Option<String> {
     let img = match image::open(wallpaper) {
